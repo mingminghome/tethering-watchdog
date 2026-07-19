@@ -1,0 +1,26 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+**/build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+*.log
+.grok/
+
+# Local machine & secrets (never commit)
+local.properties
+secrets.properties
+*.jks
+*.keystore
+release.keystore
