@@ -8,6 +8,7 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.GradientDrawable;
+import android.hardware.usb.UsbManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -75,6 +76,9 @@ public class MainActivity extends AppCompatActivity {
     private HandlerThread workerThread;
     private Handler worker;
     private String lastNotifiedRadioTransition;
+    private String lastAutoTetherKey = "";
+    private long lastAutoTetherMs;
+    private static final long AUTO_TETHER_COOLDOWN_MS = 15_000L;
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -121,6 +125,24 @@ public class MainActivity extends AppCompatActivity {
             if (intent == null) return;
             applyUsbExtras(intent);
             // Immediate refresh on plug/unplug — don't wait for the poll timer.
+            if (worker != null && activityResumed) {
+                worker.post(usbStatusOnce);
+            }
+        }
+    };
+
+    /** USB host (hub / ethernet adapter) — USB_STATE gadget extras do not fire for this. */
+    private final BroadcastReceiver usbDeviceReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent != null && UsbManager.ACTION_USB_DEVICE_DETACHED.equals(intent.getAction())) {
+                lastAutoTetherKey = "";
+                lastAutoTetherMs = 0;
+            } else if (intent != null && UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(intent.getAction())) {
+                lastAutoTetherKey = "";
+                lastAutoTetherMs = 0;
+            }
+            linkMonitor.onHostDeviceChanged();
             if (worker != null && activityResumed) {
                 worker.post(usbStatusOnce);
             }
@@ -209,7 +231,7 @@ public class MainActivity extends AppCompatActivity {
             statusText.setTextColor(0xFFEF6C00);
             markResetNow();
 
-            RootUtil.performResetSequence(() -> runOnUiThread(() -> {
+            RootUtil.performResetSequence(this, () -> runOnUiThread(() -> {
                 manualBtn.setEnabled(rootOk);
                 manualBtn.setText("RESET");
                 markResetNow();
@@ -389,6 +411,37 @@ public class MainActivity extends AppCompatActivity {
             }
             compareHintText.setText(hint);
         }
+        maybeAutoEnableTether(snap);
+    }
+
+    /**
+     * Hub/ethernet adapter: auto-enable ethernet tethering (never force RNDIS —
+     * that would drop the hub). USB gadget tethering is enabled on Reset / Auto-recover.
+     */
+    private void maybeAutoEnableTether(UsbLinkMonitor.Snapshot snap) {
+        if (!rootOk || snap == null) return;
+        if (!UsbLinkMonitor.MODE_ETHERNET.equals(snap.tetherMode)) {
+            if (lastAutoTetherKey.startsWith("ethernet:")) lastAutoTetherKey = "";
+            return;
+        }
+        if (snap.tetherAlive) {
+            lastAutoTetherKey = "ethernet:" + snap.ethernetIface;
+            return;
+        }
+        // Ethernet peer link down — wait for carrier; don't spam enable / data bounce.
+        if (!snap.ethernetLinkUp) {
+            lastAutoTetherKey = "";
+            lastAutoTetherMs = 0;
+            return;
+        }
+        String key = "ethernet:" + (snap.ethernetIface != null ? snap.ethernetIface : "hub");
+        long now = System.currentTimeMillis();
+        if (key.equals(lastAutoTetherKey) && now - lastAutoTetherMs < AUTO_TETHER_COOLDOWN_MS) {
+            return;
+        }
+        lastAutoTetherKey = key;
+        lastAutoTetherMs = now;
+        RootUtil.enableDetectedTethering(this, UsbLinkMonitor.MODE_ETHERNET);
     }
 
     private void applyRadioSnapshot(RadioMonitor.Snapshot radio, UsbLinkMonitor.Snapshot usb) {
@@ -401,7 +454,8 @@ public class MainActivity extends AppCompatActivity {
 
         boolean tetherActive = usb != null
                 && usb.usbConnected
-                && (usb.rndisFunction || usb.ifaceName != null);
+                && (usb.rndisFunction || usb.ifaceName != null
+                || UsbLinkMonitor.MODE_ETHERNET.equals(usb.tetherMode));
         boolean cableIn = usb != null && usb.usbConnected;
         String liveCtx = RadioMonitor.classifyDropContext(
                 cableIn, tetherActive, lastResetElapsed(), SystemClock.elapsedRealtime());
@@ -602,8 +656,8 @@ public class MainActivity extends AppCompatActivity {
 
         // Placeholder until first sample
         setUsbBadge("…", 0xFF9E9E9E);
-        usbSpeedTier.setText("USB · checking…");
-        usbDetailText.setText("Reading USB state…");
+        usbSpeedTier.setText("Link · checking…");
+        usbDetailText.setText("Reading tether state…");
         setRadioBadge("…", 0xFF9E9E9E);
         radioDetailText.setText("Checking radio…");
         String savedEvent = prefs.getString(RadioMonitor.PREF_LAST_RADIO_EVENT, null);
@@ -698,6 +752,15 @@ public class MainActivity extends AppCompatActivity {
             applyUsbExtras(sticky);
         }
 
+        IntentFilter usbDevFilter = new IntentFilter();
+        usbDevFilter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        usbDevFilter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(usbDeviceReceiver, usbDevFilter, systemReceiverFlags());
+        } else {
+            registerReceiver(usbDeviceReceiver, usbDevFilter);
+        }
+
         startUsbStatusPolling();
         if (debugMetricsOn) startPingLoop();
     }
@@ -711,6 +774,9 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception ignored) {}
         try {
             unregisterReceiver(usbReceiver);
+        } catch (Exception ignored) {}
+        try {
+            unregisterReceiver(usbDeviceReceiver);
         } catch (Exception ignored) {}
         super.onPause();
     }

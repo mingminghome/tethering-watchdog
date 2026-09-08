@@ -53,6 +53,42 @@ public class RadioMonitorTest {
         // Override wins for 5G NSA over plain LTE+CA
         assertEquals(RadioMonitor.LABEL_5G,
                 RadioMonitor.mergeLabel(RadioMonitor.LABEL_4G, RadioMonitor.LABEL_5G, true));
+        // NR state must win over LTE+CA — otherwise NSA 5G sticks on 4G+
+        assertEquals(RadioMonitor.LABEL_5G,
+                RadioMonitor.mergeLabel(RadioMonitor.LABEL_4G, null, true,
+                        RadioMonitor.LABEL_5G));
+        assertEquals(RadioMonitor.LABEL_5G_PLUS,
+                RadioMonitor.mergeLabel(RadioMonitor.LABEL_4G, RadioMonitor.LABEL_5G, true,
+                        RadioMonitor.LABEL_5G_PLUS));
+    }
+
+    @Test
+    public void labelFromNrState_connectedAndAvailableAre5g() {
+        assertEquals(RadioMonitor.LABEL_5G, RadioMonitor.labelFromNrState(3));
+        assertEquals(RadioMonitor.LABEL_5G, RadioMonitor.labelFromNrState(2));
+        assertEquals(null, RadioMonitor.labelFromNrState(1));
+        assertEquals(null, RadioMonitor.labelFromNrState(0));
+    }
+
+    @Test
+    public void labelFromServiceStateText_parsesOemNr() {
+        assertEquals(RadioMonitor.LABEL_5G,
+                RadioMonitor.labelFromServiceStateText(
+                        "nrState=CONNECTED nsaState=5 isNrAvailable=true"));
+        assertEquals(RadioMonitor.LABEL_5G,
+                RadioMonitor.labelFromServiceStateText("nrState=NOT_RESTRICTED"));
+        assertEquals(RadioMonitor.LABEL_5G,
+                RadioMonitor.labelFromServiceStateText("EnDc=true 5G Allocated=true"));
+        assertEquals(null,
+                RadioMonitor.labelFromServiceStateText("nrState=NONE LTE"));
+    }
+
+    @Test
+    public void labelFromNetworkType_nrAndLteCa() {
+        assertEquals(RadioMonitor.LABEL_5G,
+                RadioMonitor.labelFromNetworkType(android.telephony.TelephonyManager.NETWORK_TYPE_NR));
+        assertEquals(RadioMonitor.LABEL_4G_PLUS,
+                RadioMonitor.labelFromNetworkType(19));
     }
 
     @Test

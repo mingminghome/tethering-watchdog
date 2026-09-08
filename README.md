@@ -1,28 +1,49 @@
 # Tether Watchdog
 
-**Aim:** optimize and stabilize **USB tethering** — keep the link up, prefer a clean mobile uplink, apply root-side network tweaks, and show when radio quality (e.g. 4G+ → 4G) changes while you tether.
+**Aim:** optimize and stabilize **USB and ethernet tethering** — keep the link up, prefer a clean mobile uplink, apply root-side network tweaks, and show when radio quality (e.g. 4G+ → 4G) changes while you tether.
 
 - **Package:** `com.mmhw.tetherwatchdog`
 - **Min SDK:** 26 · **Target SDK:** 35
-- **Version:** 1.0
+- **Version:** 1.1
 - **License:** [MIT](LICENSE)
 
 ## Tethering optimization (root)
 
-These run when you press **RESET** or when **Auto-recover** heals the link (`RootUtil.performResetSequence` / `forceMobileDataPriority`):
+These run when you press **RESET** or when **Auto-recover** heals the link (`RootUtil.performResetSequence` / `forceMobileDataPriority`). Tether mode is auto-detected: a USB hub / ethernet adapter uses **ethernet tethering**; a direct cable to a PC uses **USB (RNDIS)** tethering. Reset uses the same detection — it will **not** force RNDIS while a hub is attached (that would drop the hub).
+
+Shared (both modes):
 
 | Optimization | What it does |
 |--------------|----------------|
 | **Mobile data bounce** | `svc data` off → on so the radio reattaches cleanly |
 | **DNS flush** | Clears resolver state that can stick after a bad tether |
-| **TCP tuning** | Window scaling, larger `rmem`/`wmem`, try **BBR** congestion control |
+| **TCP tuning** | Window scaling, larger `rmem`/`wmem`, **BBR**, MTU probing, no slow-start after idle |
 | **IP forwarding** | Ensures the phone can forward tether traffic |
-| **Force RNDIS** | `svc usb setFunctions rndis,adb` |
-| **USB iface MTU 1440** | Sets MTU on `rndis0` / `usb0` / `ncm0` (helps some hosts / tunnels) |
 | **TTL fix** | `iptables` mangle TTL 64 (reduces some carrier tether detection quirks) |
-| **Mobile default route** | Drops Wi‑Fi default when needed; prefers cellular (`rmnet*` / similar) as uplink |
-| **Auto-recover** | Background heal on USB reconnect or dead RNDIS iface |
+| **Mobile default route** | Drops Wi‑Fi / ethernet default when needed; prefers cellular (`rmnet*` / similar) as uplink |
+| **Auto-recover** | Background heal on USB reconnect, hub unplug/replug, or a dead ethernet path. If the ethernet link drops, Android turns ethernet tethering off — Auto-recover waits for the link and turns it back on (no mobile-data bounce while the link is down). |
 | **Route priority on start** | Auto-recover service prefers mobile as default route without a full bounce |
+
+USB gadget (direct cable to a PC):
+
+| Optimization | What it does |
+|--------------|----------------|
+| **Force RNDIS** | `svc usb setFunctions rndis,adb` |
+| **USB iface MTU 1440** | Sets MTU on `rndis0` / `usb0` / `ncm0` (avoids RNDIS / tunnel fragmentation) |
+
+Ethernet (USB hub / USB-C dock) — different link-layer path; **does not** use the USB 1440 MTU:
+
+| Optimization | What it does |
+|--------------|----------------|
+| **Ethernet tethering** | Enable ethernet tethering, leave USB in host mode (RNDIS would drop the hub) |
+| **Auto-enable hub** | When a hub/ethernet adapter appears, ethernet tethering is turned on automatically |
+| **MTU 1500** | Full ethernet frames on `eth*` |
+| **MSS clamp** | `TCPMSS --clamp-mss-to-pmtu` so 1500 LAN packets fit the cellular path |
+| **rp_filter off** | Strict reverse-path filter otherwise drops NAT’d tether packets |
+| **USB autosuspend off** | Keeps the ethernet adapter awake (autosuspend shows up as jitter) |
+| **txqueuelen / backlog** | Larger queues on the LAN NIC for 5G bursts |
+| **fq_codel** | Lower latency under load on the ethernet side |
+| **GRO/GSO/TSO** | NIC offloads when `ethtool` is available |
 
 Without root, the app still **monitors** tether and radio; it cannot apply the kernel / `svc` optimisations above.
 
@@ -30,8 +51,8 @@ Without root, the app still **monitors** tether and radio; it cannot apply the k
 
 | Area | What it does |
 |------|----------------|
-| **USB connection** | Plug / tether state, link tier when available |
-| **Mobile radio** | 4G / 4G+ / 5G, RSRP, step-down events |
+| **Tether link** | USB gadget (RNDIS) or ethernet hub, link tier when available |
+| **Mobile radio** | 4G / 4G+ / 5G (incl. NSA), RSRP, step-down events |
 | **Drop context** | `tethered` · `idle (no USB)` · `after reset` · `cable only` |
 | **Live metrics** | Optional rates + light internet probe (app open) |
 

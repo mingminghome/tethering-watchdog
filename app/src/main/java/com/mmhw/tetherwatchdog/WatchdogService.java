@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -26,6 +27,8 @@ public class WatchdogService extends Service {
 
     public static final String PREFS = "TetherPrefs";
     public static final String KEY_WATCHDOG = "watchdog_enabled";
+    /** Remember ethernet tethering across ethernet link drops. */
+    public static final String KEY_WANT_ETHERNET = "want_ethernet_tether";
     public static final String ACTION_STATUS = "com.mmhw.tetherwatchdog.STATUS";
     public static final String EXTRA_LINE = "line";
     public static final String EXTRA_QUALITY = "quality";
@@ -68,6 +71,16 @@ public class WatchdogService extends Service {
     private String lastRadioContext = "";
     private String lastNotifyText = "";
     private long lastNotifyMs;
+    private String lastAutoTetherKey = "";
+    private long lastAutoTetherMs;
+    private int ethernetHealFails;
+    private boolean waitingForEthernetLink;
+    private boolean wantEthernetTether;
+    private static final long AUTO_TETHER_COOLDOWN_MS = 15_000L;
+    /** Light enable retries while carrier is UP before a full data-bounce reset. */
+    private static final int ETHERNET_HEAL_BEFORE_RESET = 3;
+    private static final String ACTION_TETHER_STATE_CHANGED =
+            "android.net.conn.TETHER_STATE_CHANGED";
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -95,6 +108,25 @@ public class WatchdogService extends Service {
             }
             applyUsbState(sticky);
 
+            wantEthernetTether = getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .getBoolean(KEY_WANT_ETHERNET, false);
+
+            IntentFilter tetherFilter = new IntentFilter(ACTION_TETHER_STATE_CHANGED);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(tetherStateReceiver, tetherFilter, Context.RECEIVER_EXPORTED);
+            } else {
+                registerReceiver(tetherStateReceiver, tetherFilter);
+            }
+
+            IntentFilter usbDevFilter = new IntentFilter();
+            usbDevFilter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+            usbDevFilter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(usbDeviceReceiver, usbDevFilter, Context.RECEIVER_EXPORTED);
+            } else {
+                registerReceiver(usbDeviceReceiver, usbDevFilter);
+            }
+
             RootUtil.forceMobileDataPriority();
 
             worker.post(sampleLoop);
@@ -112,14 +144,17 @@ public class WatchdogService extends Service {
                     linkMonitor.sample(usbConnected, usbConfigured, rndisFunction);
             applySnapshot(usb, false);
             applyRadio(radioMonitor.sample(WatchdogService.this),
-                    usb.usbConnected && (usb.rndisFunction || usb.ifaceName != null));
-            publishStatus();
-            updateNotification(shortNotifyText());
-
-            if (usbConnected && rndisFunction
+                    usb.usbConnected && (usb.rndisFunction || usb.ifaceName != null
+                            || UsbLinkMonitor.MODE_ETHERNET.equals(usb.tetherMode)));
+            maybeAutoEnableEthernet(usb);
+            if (!UsbLinkMonitor.MODE_ETHERNET.equals(usb.tetherMode)
+                    && !usb.ethernetPresent
+                    && usbConnected && rndisFunction
                     && "STARTING".equals(lastQuality) && !resetInFlight) {
                 maybeAutoReset("rndis_iface_down");
             }
+            publishStatus();
+            updateNotification(shortNotifyText());
 
             if (worker != null) {
                 worker.postDelayed(this, SAMPLE_INTERVAL_MS);
@@ -147,12 +182,131 @@ public class WatchdogService extends Service {
                             linkMonitor.sample(usbConnected, usbConfigured, rndisFunction);
                     applySnapshot(usb, true);
                     applyRadio(radioMonitor.sample(WatchdogService.this),
-                            usb.usbConnected && (usb.rndisFunction || usb.ifaceName != null));
+                            usb.usbConnected && (usb.rndisFunction || usb.ifaceName != null
+                                    || UsbLinkMonitor.MODE_ETHERNET.equals(usb.tetherMode)));
+                    maybeAutoEnableEthernet(usb);
                     publishStatus();
                 });
             }
         }
     };
+
+    /**
+     * Android turns ethernet tethering off when the peer link drops.
+     * Re-sample and restore if the link is already back.
+     */
+    private final BroadcastReceiver tetherStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (worker == null) return;
+            worker.post(() -> {
+                UsbLinkMonitor.Snapshot usb =
+                        linkMonitor.sample(usbConnected, usbConfigured, rndisFunction);
+                applySnapshot(usb, true);
+                maybeAutoEnableEthernet(usb);
+                publishStatus();
+            });
+        }
+    };
+
+    private final BroadcastReceiver usbDeviceReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (worker == null || intent == null) return;
+            final String action = intent.getAction();
+            worker.post(() -> {
+                linkMonitor.onHostDeviceChanged();
+                boolean detached = UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action);
+                boolean attached = UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action);
+                if (detached) {
+                    // Hub/port gone — next attach is a fresh enable, not a cooldown skip.
+                    lastAutoTetherKey = "";
+                    lastAutoTetherMs = 0;
+                    ethernetHealFails = 0;
+                }
+                if (attached) {
+                    lastAutoTetherKey = "";
+                    lastAutoTetherMs = 0;
+                }
+                UsbLinkMonitor.Snapshot usb =
+                        linkMonitor.sample(usbConnected, usbConfigured, rndisFunction);
+                applySnapshot(usb, true);
+                if (!detached) {
+                    maybeAutoEnableEthernet(usb);
+                }
+                publishStatus();
+            });
+        }
+    };
+
+    /**
+     * Restore ethernet tethering after Android turns it off because the ethernet
+     * link dropped. Wait while carrier is down — do not bounce mobile data.
+     * Re-enable as soon as the ethernet link is up again.
+     */
+    private void maybeAutoEnableEthernet(UsbLinkMonitor.Snapshot usb) {
+        if (usb == null) return;
+
+        if (usb.ethernetPresent || usb.tetherAlive
+                || UsbLinkMonitor.MODE_ETHERNET.equals(usb.tetherMode)) {
+            setWantEthernet(true);
+        } else if (usb.rndisFunction && !usb.ethernetPresent) {
+            setWantEthernet(false);
+        }
+
+        boolean present = usb.ethernetPresent
+                || UsbLinkMonitor.MODE_ETHERNET.equals(usb.tetherMode);
+        int action = UsbLinkMonitor.ethernetRecoverAction(
+                wantEthernetTether, present, usb.ethernetLinkUp, usb.tetherAlive);
+
+        if (action == UsbLinkMonitor.ETH_RECOVER_IDLE) {
+            lastAutoTetherKey = "ethernet:" + usb.ethernetIface;
+            ethernetHealFails = 0;
+            waitingForEthernetLink = false;
+            return;
+        }
+
+        if (action == UsbLinkMonitor.ETH_RECOVER_WAIT) {
+            // Peer link down — keep intent, wait for carrier. No radio reset.
+            ethernetHealFails = 0;
+            lastAutoTetherKey = "";
+            lastAutoTetherMs = 0;
+            if (!waitingForEthernetLink) {
+                waitingForEthernetLink = true;
+                lastDetail = "Ethernet link down · waiting to restore tethering";
+            }
+            return;
+        }
+
+        // Link is up, tethering is off (Android disabled it when the link dropped).
+        if (waitingForEthernetLink) {
+            waitingForEthernetLink = false;
+            lastAutoTetherMs = 0;
+        }
+        String key = "ethernet:" + (usb.ethernetIface != null ? usb.ethernetIface : "hub");
+        long now = System.currentTimeMillis();
+        if (key.equals(lastAutoTetherKey) && now - lastAutoTetherMs < AUTO_TETHER_COOLDOWN_MS) {
+            return;
+        }
+        lastAutoTetherKey = key;
+        lastAutoTetherMs = now;
+        ethernetHealFails++;
+        if (ethernetHealFails >= ETHERNET_HEAL_BEFORE_RESET && !resetInFlight) {
+            lastDetail = "Auto-reset: ethernet_down";
+            maybeAutoReset("ethernet_down");
+            ethernetHealFails = 0;
+            return;
+        }
+        lastDetail = "Restoring ethernet tethering";
+        RootUtil.enableDetectedTethering(this, UsbLinkMonitor.MODE_ETHERNET);
+    }
+
+    private void setWantEthernet(boolean want) {
+        if (wantEthernetTether == want) return;
+        wantEthernetTether = want;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putBoolean(KEY_WANT_ETHERNET, want).apply();
+    }
 
     private void applySnapshot(UsbLinkMonitor.Snapshot snap, boolean forceDetail) {
         lastQuality = snap.quality;
@@ -160,7 +314,9 @@ public class WatchdogService extends Service {
         lastSpeedTier = snap.speedTier != null ? snap.speedTier : "USB · —";
         lastStatusLine = snap.summaryLine();
 
-        boolean holdDetail = lastDetail.startsWith("Auto-reset:");
+        boolean holdDetail = lastDetail.startsWith("Auto-reset:")
+                || lastDetail.startsWith("Ethernet link down")
+                || lastDetail.startsWith("Restoring ethernet");
         if (forceDetail || (snap.detail != null && !snap.detail.isEmpty() && !holdDetail)) {
             lastDetail = snap.detail != null ? snap.detail : "";
         }
@@ -245,7 +401,7 @@ public class WatchdogService extends Service {
         publishStatus();
         updateNotification("Auto-reset: " + reason);
 
-        RootUtil.performResetSequence(() -> {
+        RootUtil.performResetSequence(this, () -> {
             resetInFlight = false;
             lastDetail = "Auto-reset done (" + reason + ")";
             lastResetElapsedRealtime = SystemClock.elapsedRealtime();
@@ -337,6 +493,12 @@ public class WatchdogService extends Service {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_WATCHDOG, false).apply();
         try {
             unregisterReceiver(usbReceiver);
+        } catch (Exception ignored) {}
+        try {
+            unregisterReceiver(usbDeviceReceiver);
+        } catch (Exception ignored) {}
+        try {
+            unregisterReceiver(tetherStateReceiver);
         } catch (Exception ignored) {}
         if (worker != null) worker.removeCallbacksAndMessages(null);
         if (workerThread != null) workerThread.quitSafely();

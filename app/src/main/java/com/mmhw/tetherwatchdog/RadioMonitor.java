@@ -11,6 +11,7 @@ import android.telephony.CellInfoNr;
 import android.telephony.CellSignalStrength;
 import android.telephony.CellSignalStrengthLte;
 import android.telephony.CellSignalStrengthNr;
+import android.telephony.NetworkRegistrationInfo;
 import android.telephony.ServiceState;
 import android.telephony.SignalStrength;
 import android.telephony.SubscriptionManager;
@@ -24,13 +25,12 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Detects mobile radio display type (4G / 4G+ / 5G) and optional LTE signal metrics.
- * Used to surface step-downs like 4G+ → 4G while USB tethering is active.
+ * Detects mobile radio display type (4G / 4G+ / 5G) and optional LTE/NR signal metrics.
+ * Used to surface step-downs like 4G+ → 4G or 5G → 4G while tethering is active.
  *
- * <p>Public APIs only for targetSdk 30+:
- * {@code TelephonyDisplayInfo} override (LTE_CA → 4G+), multi-entry
- * {@link ServiceState#getCellBandwidths()}, and {@link TelephonyManager#getSignalStrength()}.
- * Do <em>not</em> reflect {@code isUsingCarrierAggregation()} — hidden/blocked and logspam.
+ * <p>5G NSA usually keeps {@code getDataNetworkType()} as LTE; the status-bar 5G icon
+ * comes from {@link TelephonyDisplayInfo} override, {@link NetworkRegistrationInfo}
+ * NR state, and/or {@code ServiceState} text ({@code nrState=CONNECTED}).
  */
 public class RadioMonitor {
 
@@ -148,13 +148,24 @@ public class RadioMonitor {
     }
 
     /**
-     * Merge base network label with display override + CA evidence.
+     * Merge base network label with display override, NR state, and CA evidence.
      * Used by tests and {@link #fillNetworkLabel}.
+     *
+     * <p>NR (5G NSA/SA) must win over LTE CA: a 5G NSA phone still reports LTE + CA,
+     * which would otherwise stick the badge on 4G+.
      */
     public static String mergeLabel(String baseLabel, String overrideLabel, boolean carrierAgg) {
+        return mergeLabel(baseLabel, overrideLabel, carrierAgg, null);
+    }
+
+    public static String mergeLabel(String baseLabel, String overrideLabel,
+                                    boolean carrierAgg, String nrLabel) {
         String best = baseLabel != null ? baseLabel : LABEL_UNKNOWN;
         if (overrideLabel != null && rank(overrideLabel) > rank(best)) {
             best = overrideLabel;
+        }
+        if (nrLabel != null && rank(nrLabel) > rank(best)) {
+            best = nrLabel;
         }
         // Modem CA often true while override still NONE — match status bar 4G+
         if (carrierAgg && rank(best) == rank(LABEL_4G)) {
@@ -233,7 +244,7 @@ public class RadioMonitor {
 
         if (!s.phoneStateGranted) {
             s.label = LABEL_UNKNOWN;
-            s.detailLine = "Allow Phone permission to watch 4G / 4G+";
+            s.detailLine = "Allow Phone permission to watch 4G / 5G";
             s.available = false;
             return s;
         }
@@ -318,32 +329,27 @@ public class RadioMonitor {
         s.networkTypeName = networkTypeName(dataType);
         String base = labelFromNetworkType(dataType);
         String fromOverride = null;
+        String fromNr = null;
         String source = "dataType";
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Some SDK stubs omit getTelephonyDisplayInfo(); use reflection for portability.
-            try {
-                Object di = tm.getClass().getMethod("getTelephonyDisplayInfo").invoke(tm);
-                if (di != null) {
-                    int nt = (Integer) di.getClass().getMethod("getNetworkType").invoke(di);
-                    if (nt != TelephonyManager.NETWORK_TYPE_UNKNOWN) {
-                        s.networkTypeName = networkTypeName(nt);
-                        String fromNt = labelFromNetworkType(nt);
-                        if (rank(fromNt) > rank(base)) {
-                            base = fromNt;
-                            source = "display.network";
-                        }
-                    }
-                    int override = (Integer) di.getClass()
-                            .getMethod("getOverrideNetworkType").invoke(di);
-                    s.overrideName = overrideName(override);
-                    fromOverride = labelFromOverride(override);
-                    if (fromOverride != null) {
-                        source = "display." + s.overrideName;
+            DisplayInfoBits di = readDisplayInfo(tm);
+            if (di.error) {
+                s.overrideName = "err";
+            } else if (di.present) {
+                if (di.networkType != TelephonyManager.NETWORK_TYPE_UNKNOWN) {
+                    s.networkTypeName = networkTypeName(di.networkType);
+                    String fromNt = labelFromNetworkType(di.networkType);
+                    if (rank(fromNt) > rank(base)) {
+                        base = fromNt;
+                        source = "display.network";
                     }
                 }
-            } catch (Exception e) {
-                s.overrideName = "err";
+                s.overrideName = overrideName(di.overrideType);
+                fromOverride = labelFromOverride(di.overrideType);
+                if (fromOverride != null) {
+                    source = "display." + s.overrideName;
+                }
             }
         }
 
@@ -354,6 +360,17 @@ public class RadioMonitor {
             ServiceState ss = tm.getServiceState();
             if (ss != null) {
                 bwCount = countValidBandwidths(ss);
+                NrHint nr = nrHintFromServiceState(ss);
+                if (nr.label != null) {
+                    fromNr = nr.label;
+                    if (rank(fromNr) > rank(base) && rank(fromNr) >= rank(fromOverride)) {
+                        source = nr.source;
+                    }
+                    if (s.overrideName == null || "NONE".equals(s.overrideName)
+                            || "err".equals(s.overrideName)) {
+                        s.overrideName = nr.source;
+                    }
+                }
             }
         } catch (Exception ignored) {
         }
@@ -361,8 +378,8 @@ public class RadioMonitor {
         s.carrierAggregation = ca;
         s.bandwidthCount = bwCount;
 
-        s.label = mergeLabel(base, fromOverride, ca);
-        if (ca && LABEL_4G_PLUS.equals(s.label) && fromOverride == null) {
+        s.label = mergeLabel(base, fromOverride, ca, fromNr);
+        if (ca && LABEL_4G_PLUS.equals(s.label) && fromOverride == null && fromNr == null) {
             source = "service.bw×" + bwCount;
             if (s.overrideName == null || "NONE".equals(s.overrideName)) {
                 s.overrideName = "CA(bw)";
@@ -373,6 +390,139 @@ public class RadioMonitor {
         if (s.label == null || s.label.isEmpty()) {
             s.label = LABEL_UNKNOWN;
         }
+    }
+
+    private static final class DisplayInfoBits {
+        boolean present;
+        boolean error;
+        int networkType = TelephonyManager.NETWORK_TYPE_UNKNOWN;
+        int overrideType = 0;
+    }
+
+    /**
+     * Read TelephonyDisplayInfo (API 30+) via reflection — some SDK stubs omit the method.
+     */
+    @SuppressLint("MissingPermission")
+    private static DisplayInfoBits readDisplayInfo(TelephonyManager tm) {
+        DisplayInfoBits out = new DisplayInfoBits();
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return out;
+        try {
+            Object di = tm.getClass().getMethod("getTelephonyDisplayInfo").invoke(tm);
+            if (di != null) {
+                out.present = true;
+                out.networkType = (Integer) di.getClass().getMethod("getNetworkType").invoke(di);
+                out.overrideType = (Integer) di.getClass()
+                        .getMethod("getOverrideNetworkType").invoke(di);
+            }
+        } catch (Exception e) {
+            out.error = true;
+        }
+        return out;
+    }
+
+    static final class NrHint {
+        String label;
+        String source;
+    }
+
+    /**
+     * 5G NSA/SA evidence from {@link ServiceState}.
+     * Data RAT stays LTE on NSA; status bar uses NR state / NRI / toString().
+     */
+    static NrHint nrHintFromServiceState(ServiceState ss) {
+        NrHint hint = new NrHint();
+        if (ss == null) return hint;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                List<NetworkRegistrationInfo> nris = ss.getNetworkRegistrationInfoList();
+                if (nris != null) {
+                    for (NetworkRegistrationInfo nri : nris) {
+                        if (nri == null) continue;
+                        int tech = nri.getAccessNetworkTechnology();
+                        int nrState = nrStateOf(nri);
+                        String fromState = labelFromNrState(nrState);
+                        String fromTech = labelFromNetworkType(tech);
+                        String cand = rank(fromTech) >= rank(fromState) ? fromTech : fromState;
+                        if (rank(cand) >= rank(LABEL_5G) && rank(cand) > rank(hint.label)) {
+                            hint.label = cand;
+                            hint.source = tech == TelephonyManager.NETWORK_TYPE_NR
+                                    ? "nri.NR" : "nri.nrState";
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        if (hint.label == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                int nrState = (Integer) ss.getClass().getMethod("getNrState").invoke(ss);
+                String fromState = labelFromNrState(nrState);
+                if (fromState != null) {
+                    hint.label = fromState;
+                    hint.source = "ss.nrState";
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                int freq = (Integer) ss.getClass().getMethod("getNrFrequencyRange").invoke(ss);
+                // ServiceState.FREQUENCY_RANGE_MMWAVE = 4
+                if (freq == 4 && rank(hint.label) >= rank(LABEL_5G)) {
+                    hint.label = LABEL_5G_PLUS;
+                    hint.source = "ss.mmWave";
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        if (hint.label == null) {
+            String fromText = labelFromServiceStateText(ss.toString());
+            if (fromText != null) {
+                hint.label = fromText;
+                hint.source = "ss.text";
+            }
+        }
+        return hint;
+    }
+
+    /** {@code NetworkRegistrationInfo.getNrState()} is missing from some SDK stubs. */
+    private static int nrStateOf(NetworkRegistrationInfo nri) {
+        try {
+            Object v = nri.getClass().getMethod("getNrState").invoke(nri);
+            if (v instanceof Integer) return (Integer) v;
+        } catch (Throwable ignored) {
+        }
+        return 0;
+    }
+
+    /** NetworkRegistrationInfo / ServiceState NR_STATE_* (NONE=0 … CONNECTED=3). */
+    public static String labelFromNrState(int nrState) {
+        switch (nrState) {
+            case 3: // NR_STATE_CONNECTED — actually using 5G
+            case 2: // NR_STATE_NOT_RESTRICTED — status bar often already shows 5G
+                return LABEL_5G;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * OEM-proof 5G parse of {@link ServiceState#toString()}.
+     * Samsung/Pixel dumps include {@code nrState=CONNECTED} or {@code nsaState=5}.
+     */
+    public static String labelFromServiceStateText(String text) {
+        if (text == null || text.isEmpty()) return null;
+        String t = text.toLowerCase(Locale.US);
+        if (t.contains("nrstate=connected")
+                || t.contains("nsastate=5")
+                || (t.contains("endc=true") && t.contains("5g allocated=true"))) {
+            return LABEL_5G;
+        }
+        if (t.contains("nrstate=not_restricted") || t.contains("isnravailable=true")) {
+            return LABEL_5G;
+        }
+        return null;
     }
 
     /**
@@ -581,6 +731,8 @@ public class RadioMonitor {
         switch (type) {
             case TelephonyManager.NETWORK_TYPE_NR:
                 return LABEL_5G;
+            case 19: // hidden NETWORK_TYPE_LTE_CA
+                return LABEL_4G_PLUS;
             case TelephonyManager.NETWORK_TYPE_LTE:
                 return LABEL_4G;
             case TelephonyManager.NETWORK_TYPE_HSPAP:
@@ -634,6 +786,8 @@ public class RadioMonitor {
         switch (type) {
             case TelephonyManager.NETWORK_TYPE_NR:
                 return "NR";
+            case 19: // hidden NETWORK_TYPE_LTE_CA
+                return "LTE_CA";
             case TelephonyManager.NETWORK_TYPE_LTE:
                 return "LTE";
             case TelephonyManager.NETWORK_TYPE_HSPAP:

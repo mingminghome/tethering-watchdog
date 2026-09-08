@@ -5,6 +5,8 @@ import android.net.TrafficStats;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.util.Collections;
 import java.util.Enumeration;
@@ -17,11 +19,17 @@ import java.util.Locale;
 public class UsbLinkMonitor {
 
     public static final String IFACE_CANDIDATES = "rndis0,usb0,ncm0,rndis_data0";
+    public static final String ETHERNET_CANDIDATES = "eth0,eth1,eth2,usbeth0,lan0,lan1";
     public static final String MOBILE_CANDIDATES =
             "rmnet_data0,rmnet0,rmnet_data1,rmnet_data2,rmnet_data3,"
                     + "rmnet_ipa0,rmnet_mhi0,pdp_ip0,ccmni0,ccmni1,wwan0,seth_lte0,v4-rmnet_data0";
 
+    public static final String MODE_NONE = "none";
+    public static final String MODE_USB = "usb";
+    public static final String MODE_ETHERNET = "ethernet";
+
     private static final String[] TETHER_IFACES = IFACE_CANDIDATES.split(",");
+    private static final String[] ETHERNET_IFACES = ETHERNET_CANDIDATES.split(",");
     private static final String[] MOBILE_IFACES = MOBILE_CANDIDATES.split(",");
 
     private static final long SPEED_CACHE_MS = 8_000L;
@@ -82,6 +90,23 @@ public class UsbLinkMonitor {
         public boolean ifaceUp;
         public String ifaceName;
         public String mobileIface;
+        /** {@link #MODE_USB}, {@link #MODE_ETHERNET}, or {@link #MODE_NONE}. */
+        public String tetherMode = MODE_NONE;
+        public String ethernetIface;
+        public boolean ethernetPresent;
+        /**
+         * Physical ethernet carrier. False while the peer link is down even if
+         * {@code eth0} still exists. Null if unknown.
+         */
+        public Boolean ethernetCarrier;
+        /** Carrier up, or unknown-but-iface-up. */
+        public boolean ethernetLinkUp;
+        /**
+         * True when the tether path is actually serving: ethernet has IPv4 + link up,
+         * or USB gadget RNDIS iface is up. {@code ifaceUp} alone is not enough — eth0
+         * can exist with counters while tethering/NAT is down.
+         */
+        public boolean tetherAlive;
         /** Kernel label: high-speed, super-speed, … */
         public String usbSpeed;
         /** Friendly tier: USB 2.0, USB 3.0, … */
@@ -139,6 +164,12 @@ public class UsbLinkMonitor {
         lastConnected = connected;
     }
 
+    /** USB host plug/unplug (hub / ethernet adapter) — refresh root + speed caches. */
+    public void onHostDeviceChanged() {
+        forceSpeedRefresh = true;
+        forceRootRefresh = true;
+    }
+
     public int getFlapCount() {
         return flapCount;
     }
@@ -150,6 +181,12 @@ public class UsbLinkMonitor {
         s.rndisFunction = rndisFunction;
         s.flapsInWindow = flapCount;
 
+        // Ethernet (USB hub / USB-C dock) wins over gadget RNDIS — host mode, not gadget.
+        String ethIface = canUseLocalNetSysfs() ? findEthernetIfaceLocal() : null;
+        if (ethIface == null) {
+            ethIface = findEthernetIfaceViaNetworkInterface();
+        }
+
         // 1) Local sysfs (blocked on modern untrusted_app — probe once only)
         String usbIface = canUseLocalNetSysfs() ? findTetherIfaceLocal() : null;
         // 2) Java NetworkInterface — works without root on many devices when sysfs is denied
@@ -159,14 +196,15 @@ public class UsbLinkMonitor {
 
         long usbRx = -1;
         long usbTx = -1;
-        if (usbIface != null) {
+        String rateIface = ethIface != null ? ethIface : usbIface;
+        if (rateIface != null) {
             if (canUseLocalNetSysfs()) {
-                usbRx = readLongSysfsLocal(statPath(usbIface, "rx_bytes"));
-                usbTx = readLongSysfsLocal(statPath(usbIface, "tx_bytes"));
+                usbRx = readLongSysfsLocal(statPath(rateIface, "rx_bytes"));
+                usbTx = readLongSysfsLocal(statPath(rateIface, "tx_bytes"));
             }
             // 3) TrafficStats per-iface (no SELinux on /sys/class/net)
             if (usbRx < 0 || usbTx < 0) {
-                long[] ts = trafficStatsForIface(usbIface);
+                long[] ts = trafficStatsForIface(rateIface);
                 if (ts[0] >= 0) usbRx = ts[0];
                 if (ts[1] >= 0) usbTx = ts[1];
             }
@@ -184,14 +222,15 @@ public class UsbLinkMonitor {
 
         boolean needFreshRoot = forceRootRefresh
                 || lastRootSample == null
-                || usbIface == null
+                || (usbIface == null && ethIface == null)
                 || usbRx < 0 || usbTx < 0
                 || needSpeedRefresh()
-                || (!usbConnected && !hints.connectedKnown)
+                || (!usbConnected && ethIface == null && !hints.connectedKnown)
                 || ((mob.rx <= 0 && mob.tx <= 0) && (usbRx > 0 || usbTx > 0));
 
         RootSample root = needFreshRoot ? sampleViaRootThrottled() : lastRootSample;
         if (root != null) {
+            if (root.ethIface != null && !root.ethIface.isEmpty()) ethIface = root.ethIface;
             if (root.usbIface != null && !root.usbIface.isEmpty()) usbIface = root.usbIface;
             if (root.usbRx >= 0) usbRx = root.usbRx;
             if (root.usbTx >= 0) usbTx = root.usbTx;
@@ -208,16 +247,26 @@ public class UsbLinkMonitor {
                 hints.functions = root.gadgetFunctions;
             }
             mob = pickBestMobileCounters(root);
+            rateIface = ethIface != null ? ethIface : usbIface;
             // Re-read TrafficStats if root named an iface we didn't have
-            if (usbIface != null && (usbRx < 0 || usbTx < 0)) {
-                long[] ts = trafficStatsForIface(usbIface);
+            if (rateIface != null && (usbRx < 0 || usbTx < 0)) {
+                long[] ts = trafficStatsForIface(rateIface);
                 if (usbRx < 0 && ts[0] >= 0) usbRx = ts[0];
                 if (usbTx < 0 && ts[1] >= 0) usbTx = ts[1];
             }
         }
 
+        s.ethernetIface = ethIface;
+        s.ethernetPresent = ethIface != null;
+        s.ethernetCarrier = readEthernetCarrier(ethIface, root);
+        s.tetherMode = detectTetherMode(ethIface, usbConnected, rndisFunction, usbIface, hints);
+
         if (needSpeedRefresh() || isUnknownSpeed(cachedSpeed)) {
-            if (canUseLocalNetSysfs() || canTryGadgetSysfs()) {
+            if (MODE_ETHERNET.equals(s.tetherMode)) {
+                cachedSpeed = "ethernet";
+                cachedSpeedAtMs = System.currentTimeMillis();
+                forceSpeedRefresh = false;
+            } else if (canUseLocalNetSysfs() || canTryGadgetSysfs()) {
                 String localSpeed = readUsbGadgetSpeedLocal();
                 if (!isUnknownSpeed(localSpeed)) {
                     cachedSpeed = localSpeed;
@@ -239,8 +288,11 @@ public class UsbLinkMonitor {
         }
 
         s.usbSpeed = cachedSpeed != null ? cachedSpeed : "unknown";
-        s.speedTier = speedTierLabel(s.usbSpeed);
-        s.ifaceName = usbIface;
+        s.speedTier = MODE_ETHERNET.equals(s.tetherMode)
+                ? "Ethernet"
+                : speedTierLabel(s.usbSpeed);
+        // Rates + status follow the active tether path (hub ethernet wins).
+        s.ifaceName = MODE_ETHERNET.equals(s.tetherMode) ? ethIface : usbIface;
         s.mobileIface = mob.iface;
         s.mobileSource = mob.source != null ? mob.source : mobileSource;
         mobileSource = s.mobileSource;
@@ -254,15 +306,25 @@ public class UsbLinkMonitor {
         }
         lastMobileSourceKey = srcKey;
 
-        boolean ifaceUpJava = usbIface != null && isNetworkInterfaceUp(usbIface);
-        s.ifaceUp = (usbIface != null && isIfaceUp(usbIface, root)) || ifaceUpJava
-                || (usbIface != null && usbRx >= 0); // counters visible ⇒ usable path
+        boolean ifaceUpJava = s.ifaceName != null && isNetworkInterfaceUp(s.ifaceName);
+        boolean ifaceUpSys = s.ifaceName != null && isIfaceUp(s.ifaceName, root);
+        if (MODE_ETHERNET.equals(s.tetherMode)) {
+            // Do not treat "counters readable" as up — eth0 exists while NAT is down.
+            s.ifaceUp = ifaceUpSys || ifaceUpJava;
+            s.ethernetLinkUp = ethernetLinkUp(s.ethernetCarrier, s.ifaceUp);
+            s.tetherAlive = ethernetTetherAlive(s.ethernetPresent, s.ifaceUp,
+                    ifaceHasIpv4(s.ifaceName), s.ethernetLinkUp);
+        } else {
+            s.ifaceUp = ifaceUpSys || ifaceUpJava
+                    || (s.ifaceName != null && usbRx >= 0); // counters visible ⇒ usable path
+            s.tetherAlive = s.ifaceUp && (s.rndisFunction || s.ifaceName != null);
+        }
 
         // Reconcile plug / tether flags with sysfs/getprop (more reliable than USB_STATE alone).
         if (hints.connectedKnown) {
             s.usbConnected = hints.connected || s.usbConnected;
         }
-        if (usbIface != null) {
+        if (usbIface != null || ethIface != null) {
             s.usbConnected = true;
         }
         boolean funcsTether = hints.functions != null
@@ -270,8 +332,12 @@ public class UsbLinkMonitor {
                 || hints.functions.contains("ncm")
                 || hints.functions.contains("eem")
                 || hints.functions.contains("usbnet"));
-        if (funcsTether || s.ifaceUp || usbIface != null) {
+        if (!MODE_ETHERNET.equals(s.tetherMode)
+                && (funcsTether || (s.ifaceUp && usbIface != null) || usbIface != null)) {
             s.rndisFunction = true;
+        }
+        if (!MODE_ETHERNET.equals(s.tetherMode)) {
+            s.tetherAlive = s.ifaceUp && (s.rndisFunction || s.ifaceName != null);
         }
 
         long now = System.currentTimeMillis();
@@ -481,13 +547,121 @@ public class UsbLinkMonitor {
         return c;
     }
 
+    /**
+     * Hub / USB-C dock ethernet wins: the phone is USB host, not a gadget.
+     * Direct PC cable (no eth iface) is USB RNDIS/NCM.
+     */
+    public static String detectTetherMode(String ethIface, boolean usbConnected,
+                                         boolean rndisFunction, String usbIface) {
+        return detectTetherMode(ethIface, usbConnected, rndisFunction, usbIface, null);
+    }
+
+    static String detectTetherMode(String ethIface, boolean usbConnected,
+                                   boolean rndisFunction, String usbIface, GadgetHints hints) {
+        if (ethIface != null && !ethIface.isEmpty()) return MODE_ETHERNET;
+        boolean funcsTether = hints != null && hints.functions != null
+                && (hints.functions.contains("rndis")
+                || hints.functions.contains("ncm")
+                || hints.functions.contains("eem")
+                || hints.functions.contains("usbnet"));
+        if (usbConnected || rndisFunction || usbIface != null || funcsTether) return MODE_USB;
+        return MODE_NONE;
+    }
+
+    /**
+     * Ethernet tether is serving only when the NIC is present, carrier is up, and it
+     * has an IPv4 address (typically 192.168.42.129 from the tethering stack).
+     */
+    public static boolean ethernetTetherAlive(boolean present, boolean ifaceUp, boolean hasIpv4) {
+        return ethernetTetherAlive(present, ifaceUp, hasIpv4, true);
+    }
+
+    public static boolean ethernetTetherAlive(boolean present, boolean ifaceUp,
+                                              boolean hasIpv4, boolean linkUp) {
+        return present && ifaceUp && hasIpv4 && linkUp;
+    }
+
+    public static boolean ethernetLinkUp(Boolean carrier, boolean ifaceUp) {
+        if (carrier != null) return carrier;
+        return ifaceUp;
+    }
+
+    /**
+     * What Auto-recover should do after Android drops ethernet tethering
+     * (typical when the ethernet peer link goes down).
+     * <ul>
+     *   <li>{@code 0} idle — already serving</li>
+     *   <li>{@code 1} wait — no iface yet, or carrier down (do not bounce radio)</li>
+     *   <li>{@code 2} enable — link is up but tethering is off</li>
+     * </ul>
+     */
+    public static final int ETH_RECOVER_IDLE = 0;
+    public static final int ETH_RECOVER_WAIT = 1;
+    public static final int ETH_RECOVER_ENABLE = 2;
+
+    public static int ethernetRecoverAction(boolean wantEthernet, boolean present,
+                                            boolean linkUp, boolean tetherAlive) {
+        if (tetherAlive) return ETH_RECOVER_IDLE;
+        if (!wantEthernet && !present) return ETH_RECOVER_IDLE;
+        if (!present || !linkUp) return ETH_RECOVER_WAIT;
+        return ETH_RECOVER_ENABLE;
+    }
+
+    /** True if {@code addr} is in Android's usual tether LAN (192.168.42.0/24 or .43.0/24). */
+    public static boolean isTetherLanIpv4(byte[] addr) {
+        if (addr == null || addr.length != 4) return false;
+        int a = addr[0] & 0xff;
+        int b = addr[1] & 0xff;
+        int c = addr[2] & 0xff;
+        return a == 192 && b == 168 && (c == 42 || c == 43);
+    }
+
+    private static Boolean readEthernetCarrier(String ethIface, RootSample root) {
+        if (root != null && root.ethCarrier != null) return root.ethCarrier;
+        if (ethIface == null || ethIface.isEmpty()) return null;
+        String raw = readFirstLineLocal("/sys/class/net/" + ethIface + "/carrier");
+        if ("1".equals(raw)) return true;
+        if ("0".equals(raw)) return false;
+        return null;
+    }
+
+    static boolean ifaceHasIpv4(String name) {
+        if (name == null || name.isEmpty()) return false;
+        try {
+            NetworkInterface ni = NetworkInterface.getByName(name);
+            if (ni == null) return false;
+            Enumeration<InetAddress> en = ni.getInetAddresses();
+            if (en == null) return false;
+            while (en.hasMoreElements()) {
+                InetAddress a = en.nextElement();
+                if (a instanceof Inet4Address && !a.isLoopbackAddress()) return true;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    static boolean isEthernetIfaceName(String n) {
+        if (n == null || n.isEmpty()) return false;
+        if (n.equals("lo") || n.startsWith("wlan") || n.startsWith("rndis")
+                || n.startsWith("ncm") || n.startsWith("rmnet") || n.startsWith("dummy")
+                || n.startsWith("tun") || n.startsWith("ifb") || n.startsWith("ap")) {
+            return false;
+        }
+        return n.matches("eth\\d+")
+                || n.startsWith("usbeth")
+                || n.matches("lan\\d+")
+                || n.startsWith("enx");
+    }
+
     static boolean isCellularIfaceName(String n) {
         if (n == null || n.isEmpty()) return false;
         // Skip obvious non-cellular
         if (n.equals("lo") || n.startsWith("wlan") || n.startsWith("rndis")
                 || n.startsWith("ncm") || n.matches("usb\\d+") || n.startsWith("ifb")
                 || n.startsWith("dummy") || n.startsWith("tun") || n.startsWith("tap")
-                || n.startsWith("veth") || n.startsWith("ap") || n.startsWith("softap")) {
+                || n.startsWith("veth") || n.startsWith("ap") || n.startsWith("softap")
+                || isEthernetIfaceName(n)) {
             return false;
         }
         return n.startsWith("rmnet")
@@ -518,16 +692,53 @@ public class UsbLinkMonitor {
                 || "unknown".equalsIgnoreCase(speed) || "?".equals(speed);
     }
 
+    private static String findEthernetIfaceLocal() {
+        if (!canUseLocalNetSysfs()) return null;
+        for (String name : ETHERNET_IFACES) {
+            if (new File("/sys/class/net/" + name).exists()) return name;
+        }
+        File net = new File("/sys/class/net");
+        File[] kids = net.listFiles();
+        if (kids != null) {
+            for (File d : kids) {
+                if (isEthernetIfaceName(d.getName())) return d.getName();
+            }
+        }
+        return null;
+    }
+
+    private static String findEthernetIfaceViaNetworkInterface() {
+        try {
+            Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces();
+            if (en == null) return null;
+            String fallback = null;
+            for (NetworkInterface ni : Collections.list(en)) {
+                if (ni == null) continue;
+                String n = ni.getName();
+                if (!isEthernetIfaceName(n)) continue;
+                try {
+                    if (ni.isUp()) return n;
+                } catch (Exception ignored) {
+                }
+                if (fallback == null) fallback = n;
+            }
+            return fallback;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private void grade(Snapshot s) {
-        if (!s.usbConnected && s.ifaceName == null) {
+        boolean ethernet = MODE_ETHERNET.equals(s.tetherMode);
+        if (!s.usbConnected && s.ifaceName == null && !s.ethernetPresent) {
             s.quality = "UNPLUGGED";
             s.statusLabel = "Unplugged";
-            s.detail = "No USB cable detected";
+            s.detail = "No USB cable or ethernet hub detected";
             return;
         }
 
         String speed = s.usbSpeed != null ? s.usbSpeed.toLowerCase(Locale.US) : "";
-        boolean slowPhy = speed.contains("full") || speed.contains("low");
+        boolean slowPhy = !ethernet && (speed.contains("full") || speed.contains("low"));
         boolean flappy = s.flapsInWindow >= 4;
         boolean rootOk = RootUtil.hasRootCached();
 
@@ -539,6 +750,26 @@ public class UsbLinkMonitor {
             s.quality = "LIMITED";
             s.statusLabel = "Limited";
             s.detail = s.speedTier + " only — bad contact, cable, or port angle";
+        } else if (ethernet) {
+            if (s.tetherAlive) {
+                s.quality = "HEALTHY";
+                s.statusLabel = "Healthy";
+                String ifn = s.ifaceName != null ? s.ifaceName : "eth";
+                s.detail = "Ethernet tethering · " + ifn + " up";
+            } else if (s.ethernetPresent && !s.ethernetLinkUp) {
+                s.quality = "TETHER_OFF";
+                s.statusLabel = "Link down";
+                s.detail = "Ethernet link down · tethering will restore when it returns";
+            } else if (s.ethernetPresent) {
+                s.quality = "STARTING";
+                s.statusLabel = "Starting…";
+                s.detail = "Hub/ethernet attached · restoring ethernet tethering"
+                        + (s.ethernetIface != null ? " (" + s.ethernetIface + ")" : "");
+            } else {
+                s.quality = "CONNECTED";
+                s.statusLabel = "Hub";
+                s.detail = "USB hub attached · waiting for ethernet";
+            }
         } else if (s.ifaceUp) {
             s.quality = "HEALTHY";
             s.statusLabel = "Healthy";
@@ -573,7 +804,7 @@ public class UsbLinkMonitor {
         } else if (s.usbConnected) {
             s.quality = "TETHER_OFF";
             s.statusLabel = "Tether off";
-            s.detail = "Cable connected · enable USB tethering";
+            s.detail = "Cable connected · USB tethering will be used on Reset";
         } else {
             s.quality = "CONNECTED";
             s.statusLabel = "Connected";
@@ -645,6 +876,7 @@ public class UsbLinkMonitor {
     public static String speedTierLabel(String usbSpeed) {
         if (usbSpeed == null) return "USB · —";
         String s = usbSpeed.toLowerCase(Locale.US);
+        if (s.contains("ethernet") || s.equals("eth")) return "Ethernet";
         if (s.contains("super-speed+") || s.contains("super+")) return "USB 3.1+";
         if (s.contains("super")) return "USB 3.0";
         if (s.contains("high")) return "USB 2.0";
@@ -716,6 +948,7 @@ public class UsbLinkMonitor {
     private static final class RootSample {
         String speedRaw;
         String usbIface;
+        String ethIface;
         String mobileIface;
         boolean mobileFromRoute;
         long usbRx = -1, usbTx = -1, mobRx = -1, mobTx = -1;
@@ -723,6 +956,7 @@ public class UsbLinkMonitor {
         String flags;
         Boolean gadgetConnected;
         String gadgetFunctions;
+        Boolean ethCarrier;
     }
 
     /** Best-effort plug + function hints without root (sysfs and/or SystemProperties). */
@@ -798,23 +1032,36 @@ public class UsbLinkMonitor {
                 + "  UIF=$(ls /sys/class/net 2>/dev/null | grep -E '^(rndis|usb|ncm)' | head -n1); "
                 + "fi; "
                 + "echo \"UIF:$UIF\"; "
-                + "if [ -n \"$UIF\" ]; then "
-                + "  echo \"URX:$(cat /sys/class/net/$UIF/statistics/rx_bytes 2>/dev/null)\"; "
-                + "  echo \"UTX:$(cat /sys/class/net/$UIF/statistics/tx_bytes 2>/dev/null)\"; "
-                + "  echo \"OPER:$(cat /sys/class/net/$UIF/operstate 2>/dev/null)\"; "
-                + "  echo \"FLAGS:$(cat /sys/class/net/$UIF/flags 2>/dev/null)\"; "
+                + "ETH=''; "
+                + "for n in eth0 eth1 eth2 usbeth0 lan0 lan1; do "
+                + "  [ -d \"/sys/class/net/$n\" ] && ETH=$n && break; "
+                + "done; "
+                + "if [ -z \"$ETH\" ]; then "
+                + "  ETH=$(ls /sys/class/net 2>/dev/null | grep -E '^(eth[0-9]+|usbeth|lan[0-9]+|enx)' | head -n1); "
+                + "fi; "
+                + "echo \"ETH:$ETH\"; "
+                + "if [ -n \"$ETH\" ]; then "
+                + "  echo \"ETHCAR:$(cat /sys/class/net/$ETH/carrier 2>/dev/null)\"; "
+                + "  echo \"ETHOPER:$(cat /sys/class/net/$ETH/operstate 2>/dev/null)\"; "
+                + "fi; "
+                + "TIF=${ETH:-$UIF}; "
+                + "if [ -n \"$TIF\" ]; then "
+                + "  echo \"URX:$(cat /sys/class/net/$TIF/statistics/rx_bytes 2>/dev/null)\"; "
+                + "  echo \"UTX:$(cat /sys/class/net/$TIF/statistics/tx_bytes 2>/dev/null)\"; "
+                + "  echo \"OPER:$(cat /sys/class/net/$TIF/operstate 2>/dev/null)\"; "
+                + "  echo \"FLAGS:$(cat /sys/class/net/$TIF/flags 2>/dev/null)\"; "
                 + "fi; "
                 // Prefer default-route device (real internet path), then busiest cellular iface
                 + "MIF=''; MROUTE=0; "
                 + "MIF=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}'); "
                 + "case \"$MIF\" in "
-                + "  ''|lo|wlan*|rndis*|ncm*|usb*|ifb*|dummy*|tun*|ap*) MIF='' ;; "
+                + "  ''|lo|wlan*|rndis*|ncm*|usb*|eth*|lan*|enx*|ifb*|dummy*|tun*|ap*) MIF='' ;; "
                 + "  *) MROUTE=1 ;; "
                 + "esac; "
                 + "if [ -z \"$MIF\" ]; then "
                 + "  MIF=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}'); "
                 + "  case \"$MIF\" in "
-                + "    ''|lo|wlan*|rndis*|ncm*|usb*|ifb*|dummy*|tun*|ap*) MIF='' ;; "
+                + "    ''|lo|wlan*|rndis*|ncm*|usb*|eth*|lan*|enx*|ifb*|dummy*|tun*|ap*) MIF='' ;; "
                 + "    *) MROUTE=1 ;; "
                 + "  esac; "
                 + "fi; "
@@ -882,6 +1129,13 @@ public class UsbLinkMonitor {
             } else if (line.startsWith("UIF:")) {
                 String v = line.substring(4).trim();
                 if (!v.isEmpty()) r.usbIface = v;
+            } else if (line.startsWith("ETH:")) {
+                String v = line.substring(4).trim();
+                if (!v.isEmpty()) r.ethIface = v;
+            } else if (line.startsWith("ETHCAR:")) {
+                String v = line.substring(7).trim();
+                if ("1".equals(v)) r.ethCarrier = true;
+                else if ("0".equals(v)) r.ethCarrier = false;
             } else if (line.startsWith("MIF:")) {
                 String v = line.substring(4).trim();
                 if (!v.isEmpty()) r.mobileIface = v;
@@ -1066,7 +1320,8 @@ public class UsbLinkMonitor {
     }
 
     private static boolean isIfaceUp(String iface, RootSample root) {
-        if (root != null && iface != null && iface.equals(root.usbIface)) {
+        if (root != null && iface != null
+                && (iface.equals(root.usbIface) || iface.equals(root.ethIface))) {
             if (root.operstate != null) {
                 String o = root.operstate.toLowerCase(Locale.US);
                 if (o.equals("up") || o.equals("unknown")) return true;
