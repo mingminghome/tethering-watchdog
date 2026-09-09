@@ -4,7 +4,7 @@
 
 - **Package:** `com.mmhw.tetherwatchdog`
 - **Min SDK:** 26 · **Target SDK:** 35
-- **Version:** 1.1
+- **Version:** 1.2
 - **License:** [MIT](LICENSE)
 
 ## Tethering optimization (root)
@@ -38,12 +38,13 @@ Ethernet (USB hub / USB-C dock) — different link-layer path; **does not** use 
 | **Ethernet tethering** | Enable ethernet tethering, leave USB in host mode (RNDIS would drop the hub) |
 | **Auto-enable hub** | When a hub/ethernet adapter appears, ethernet tethering is turned on automatically |
 | **MTU 1500** | Full ethernet frames on `eth*` |
-| **MSS clamp** | `TCPMSS --clamp-mss-to-pmtu` so 1500 LAN packets fit the cellular path |
+| **MSS 1400** | `TCPMSS --set-mss 1400` so 1500 LAN packets fit typical cellular tunnels (`clamp-to-pmtu` often no-ops on FORWARD) |
 | **rp_filter off** | Strict reverse-path filter otherwise drops NAT’d tether packets |
 | **USB autosuspend off** | Keeps the ethernet adapter awake (autosuspend shows up as jitter) |
-| **txqueuelen / backlog** | Larger queues on the LAN NIC for 5G bursts |
-| **fq_codel** | Lower latency under load on the ethernet side |
-| **GRO/GSO/TSO** | NIC offloads when `ethtool` is available |
+| **EEE off** | Stops many USB adapters falling back to 10 Mbps |
+| **Offloads off** | GRO/GSO/TSO on USB-ethernet NAT forwarding often *cuts* throughput |
+| **10 Mbps kick** | If the PHY is 10 Mbps, re-negotiate then try 100/full |
+| **fq_codel** | AQM on ethernet *and* the cellular hop (a 5000-packet TX queue is ~6s of delay at 10 Mbps) |
 
 Without root, the app still **monitors** tether and radio; it cannot apply the kernel / `svc` optimisations above.
 

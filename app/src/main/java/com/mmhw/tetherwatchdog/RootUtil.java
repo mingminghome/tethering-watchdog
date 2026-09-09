@@ -244,7 +244,8 @@ public class RootUtil {
 
     /**
      * Shared uplink / TCP tweaks (both USB and ethernet).
-     * Ethernet then adds link-layer tunings; USB keeps the RNDIS 1440 MTU workaround.
+     * Ethernet then adds link-layer tunings (MSS 1400, EEE/offloads off);
+     * USB keeps the RNDIS 1440 MTU workaround.
      */
     private static final String TCP_AND_FORWARD =
             "sysctl -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true\n"
@@ -302,7 +303,10 @@ public class RootUtil {
      * Do NOT switch USB gadget functions — {@code rndis} would drop the hub.
      * Link-layer tunings differ from USB: full 1500 MTU, no RNDIS 1440 clamp,
      * disable USB autosuspend on the adapter, relax rp_filter so NAT forwards,
-     * MSS clamp for cellular PMTU, fq_codel on the LAN side.
+     * fixed MSS 1400 (clamp-to-pmtu often no-ops on FORWARD), fq_codel on LAN
+     * and cellular. Do not inflate txqueuelen — 5000 packets at 10 Mbps is ~6s
+     * of bufferbloat when {@code tc} is missing. USB-ethernet offloads and EEE
+     * are disabled: TSO/GRO hurt NAT, EEE often falls back to 10 Mbps.
      */
     private static final String ENABLE_ETHERNET =
             "if [ -n \"$ETH\" ]; then\n"
@@ -317,7 +321,22 @@ public class RootUtil {
                     + "  done\n"
                     + "  ip link set \"$ETH\" up 2>/dev/null || ifconfig \"$ETH\" up 2>/dev/null || true\n"
                     + "  ip link set dev \"$ETH\" mtu 1500 2>/dev/null || ifconfig \"$ETH\" mtu 1500 2>/dev/null || true\n"
-                    + "  ip link set dev \"$ETH\" txqueuelen 5000 2>/dev/null || true\n"
+                    + "  ip link set dev \"$ETH\" txqueuelen 1000 2>/dev/null || true\n"
+                    + "  ethtool --set-eee \"$ETH\" eee off 2>/dev/null || true\n"
+                    + "  ethtool -K \"$ETH\" gro off gso off tso off ufo off 2>/dev/null || true\n"
+                    + "  ETHSPEED=$(cat /sys/class/net/$ETH/speed 2>/dev/null || echo 0)\n"
+                    + "  case \"$ETHSPEED\" in 10|-1|'')\n"
+                    + "    ethtool -s \"$ETH\" autoneg on 2>/dev/null || true\n"
+                    + "    ethtool --set-eee \"$ETH\" eee off 2>/dev/null || true\n"
+                    + "    sleep 2\n"
+                    + "    ETHSPEED=$(cat /sys/class/net/$ETH/speed 2>/dev/null || echo 0)\n"
+                    + "    case \"$ETHSPEED\" in 10|-1|'')\n"
+                    + "      ethtool -s \"$ETH\" speed 100 duplex full autoneg on 2>/dev/null || true\n"
+                    + "      sleep 1\n"
+                    + "      ;;\n"
+                    + "    esac\n"
+                    + "    ;;\n"
+                    + "  esac\n"
                     + "  ip addr add 192.168.42.129/24 dev \"$ETH\" 2>/dev/null || true\n"
                     + "  echo 1 > /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/null || true\n"
                     + "  echo 1 > /proc/sys/net/ipv4/conf/$ETH/forwarding 2>/dev/null || true\n"
@@ -325,7 +344,6 @@ public class RootUtil {
                     + "  echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true\n"
                     + "  echo 0 > /proc/sys/net/ipv4/conf/$ETH/rp_filter 2>/dev/null || true\n"
                     + "  [ -n \"$MOBILE\" ] && echo 2 > /proc/sys/net/ipv4/conf/$MOBILE/rp_filter 2>/dev/null || true\n"
-                    + "  ethtool -K \"$ETH\" gro on gso on tso on rx on tx on sg on 2>/dev/null || true\n"
                     + "  tc qdisc replace dev \"$ETH\" root fq_codel 2>/dev/null || true\n"
                     + "  [ -f /sys/class/net/$ETH/queues/rx-0/rps_cpus ] && "
                     + "echo f > /sys/class/net/$ETH/queues/rx-0/rps_cpus 2>/dev/null || true\n"
@@ -342,8 +360,13 @@ public class RootUtil {
                     + "  iptables -C FORWARD -o \"$ETH\" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || "
                     + "iptables -A FORWARD -o \"$ETH\" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true\n"
                     + "  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
-                    + "  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
+                    + "  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1400 2>/dev/null || true\n"
+                    + "  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1400 2>/dev/null || true\n"
                     + "fi\n";
+
+    /** AQM on the cellular hop — that is where tether bufferbloat lives. */
+    private static final String WAN_AQM =
+            "[ -n \"$MOBILE\" ] && tc qdisc replace dev \"$MOBILE\" root fq_codel 2>/dev/null || true\n";
 
     /** USB gadget tethering (direct cable to a host). */
     private static final String ENABLE_USB =
@@ -369,6 +392,7 @@ public class RootUtil {
                 + "else\n"
                 + ENABLE_USB
                 + "fi\n"
+                + WAN_AQM
                 + TTL_FIX;
     }
 
@@ -385,6 +409,7 @@ public class RootUtil {
                 + "else\n"
                 + ENABLE_USB
                 + "fi\n"
+                + WAN_AQM
                 + TTL_FIX;
     }
 

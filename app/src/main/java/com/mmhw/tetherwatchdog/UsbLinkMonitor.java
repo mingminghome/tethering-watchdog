@@ -107,10 +107,12 @@ public class UsbLinkMonitor {
          * can exist with counters while tethering/NAT is down.
          */
         public boolean tetherAlive;
-        /** Kernel label: high-speed, super-speed, … */
+        /** Kernel label: high-speed, super-speed, ethernet-100, … */
         public String usbSpeed;
-        /** Friendly tier: USB 2.0, USB 3.0, … */
+        /** Friendly tier: USB 2.0, Ethernet · 100 Mbps, … */
         public String speedTier;
+        /** Ethernet PHY rate in Mbps, or -1 if unknown / not ethernet. */
+        public int ethernetMbps = -1;
         /** Status key for colors / logic */
         public String quality;
         /** Short badge: Healthy, Limited, Unplugged, … */
@@ -234,7 +236,11 @@ public class UsbLinkMonitor {
             if (root.usbIface != null && !root.usbIface.isEmpty()) usbIface = root.usbIface;
             if (root.usbRx >= 0) usbRx = root.usbRx;
             if (root.usbTx >= 0) usbTx = root.usbTx;
-            if (root.speedRaw != null && !root.speedRaw.isEmpty()) {
+            if (root.ethSpeedMbps > 0) {
+                cachedSpeed = "ethernet-" + root.ethSpeedMbps;
+                cachedSpeedAtMs = System.currentTimeMillis();
+                forceSpeedRefresh = false;
+            } else if (root.speedRaw != null && !root.speedRaw.isEmpty()) {
                 cachedSpeed = normalizeSpeed(root.speedRaw);
                 cachedSpeedAtMs = System.currentTimeMillis();
                 forceSpeedRefresh = false;
@@ -261,9 +267,13 @@ public class UsbLinkMonitor {
         s.ethernetCarrier = readEthernetCarrier(ethIface, root);
         s.tetherMode = detectTetherMode(ethIface, usbConnected, rndisFunction, usbIface, hints);
 
-        if (needSpeedRefresh() || isUnknownSpeed(cachedSpeed)) {
+        if (needSpeedRefresh() || isUnknownSpeed(cachedSpeed)
+                || (MODE_ETHERNET.equals(s.tetherMode)
+                && (cachedSpeed == null || !cachedSpeed.startsWith("ethernet")))) {
             if (MODE_ETHERNET.equals(s.tetherMode)) {
-                cachedSpeed = "ethernet";
+                if (cachedSpeed == null || !cachedSpeed.startsWith("ethernet")) {
+                    cachedSpeed = "ethernet";
+                }
                 cachedSpeedAtMs = System.currentTimeMillis();
                 forceSpeedRefresh = false;
             } else if (canUseLocalNetSysfs() || canTryGadgetSysfs()) {
@@ -288,8 +298,10 @@ public class UsbLinkMonitor {
         }
 
         s.usbSpeed = cachedSpeed != null ? cachedSpeed : "unknown";
+        s.ethernetMbps = MODE_ETHERNET.equals(s.tetherMode)
+                ? ethernetPhyMbps(s.usbSpeed) : -1;
         s.speedTier = MODE_ETHERNET.equals(s.tetherMode)
-                ? "Ethernet"
+                ? ethernetSpeedTierLabel(s.ethernetMbps, root != null ? root.ethDuplex : null)
                 : speedTierLabel(s.usbSpeed);
         // Rates + status follow the active tether path (hub ethernet wins).
         s.ifaceName = MODE_ETHERNET.equals(s.tetherMode) ? ethIface : usbIface;
@@ -738,7 +750,8 @@ public class UsbLinkMonitor {
         }
 
         String speed = s.usbSpeed != null ? s.usbSpeed.toLowerCase(Locale.US) : "";
-        boolean slowPhy = !ethernet && (speed.contains("full") || speed.contains("low"));
+        boolean slowUsbPhy = !ethernet && (speed.contains("full") || speed.contains("low"));
+        boolean slowEthPhy = ethernet && s.ethernetMbps > 0 && s.ethernetMbps < 100;
         boolean flappy = s.flapsInWindow >= 4;
         boolean rootOk = RootUtil.hasRootCached();
 
@@ -746,7 +759,12 @@ public class UsbLinkMonitor {
             s.quality = "UNSTABLE";
             s.statusLabel = "Unstable";
             s.detail = "Link keeps dropping — reseat cable, ease port stress";
-        } else if (slowPhy && s.usbConnected) {
+        } else if (slowEthPhy) {
+            s.quality = "LIMITED";
+            s.statusLabel = "Limited";
+            s.detail = s.speedTier
+                    + " — cable, auto-neg, or adapter fell back; 10 Mbps caps the tether";
+        } else if (slowUsbPhy && s.usbConnected) {
             s.quality = "LIMITED";
             s.statusLabel = "Limited";
             s.detail = s.speedTier + " only — bad contact, cable, or port angle";
@@ -755,7 +773,7 @@ public class UsbLinkMonitor {
                 s.quality = "HEALTHY";
                 s.statusLabel = "Healthy";
                 String ifn = s.ifaceName != null ? s.ifaceName : "eth";
-                s.detail = "Ethernet tethering · " + ifn + " up";
+                s.detail = s.speedTier + " · " + ifn + " up";
             } else if (s.ethernetPresent && !s.ethernetLinkUp) {
                 s.quality = "TETHER_OFF";
                 s.statusLabel = "Link down";
@@ -876,7 +894,7 @@ public class UsbLinkMonitor {
     public static String speedTierLabel(String usbSpeed) {
         if (usbSpeed == null) return "USB · —";
         String s = usbSpeed.toLowerCase(Locale.US);
-        if (s.contains("ethernet") || s.equals("eth")) return "Ethernet";
+        if (s.startsWith("ethernet")) return ethernetSpeedTierLabel(ethernetPhyMbps(s), null);
         if (s.contains("super-speed+") || s.contains("super+")) return "USB 3.1+";
         if (s.contains("super")) return "USB 3.0";
         if (s.contains("high")) return "USB 2.0";
@@ -885,6 +903,41 @@ public class UsbLinkMonitor {
         if (s.contains("wireless")) return "USB wireless";
         if (isUnknownSpeed(s)) return "USB · —";
         return "USB · " + usbSpeed;
+    }
+
+    /**
+     * Ethernet PHY from a cache key ({@code ethernet-100}) or a raw Mbps string.
+     * {@code 65535}/{@code -1} are kernel "unknown".
+     */
+    public static int ethernetPhyMbps(String speed) {
+        if (speed == null || speed.isEmpty()) return -1;
+        String s = speed.trim().toLowerCase(Locale.US);
+        if (s.startsWith("ethernet-")) s = s.substring("ethernet-".length());
+        else if (s.equals("ethernet") || s.equals("eth")) return -1;
+        try {
+            int n = (int) Math.round(Double.parseDouble(s.replace("mbps", "").trim()));
+            if (n <= 0 || n == 65535) return -1;
+            return n;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    public static String ethernetSpeedTierLabel(int mbps, String duplex) {
+        String rate;
+        if (mbps >= 1000) {
+            rate = (mbps % 1000 == 0)
+                    ? String.format(Locale.US, "%d Gbps", mbps / 1000)
+                    : String.format(Locale.US, "%.1f Gbps", mbps / 1000.0);
+        } else if (mbps > 0) {
+            rate = mbps + " Mbps";
+        } else {
+            return "Ethernet";
+        }
+        if (duplex != null && duplex.toLowerCase(Locale.US).contains("half")) {
+            return "Ethernet · " + rate + " half";
+        }
+        return "Ethernet · " + rate;
     }
 
     /** Find rndis/ncm/usb gadget iface without reading /sys/class/net. */
@@ -957,6 +1010,8 @@ public class UsbLinkMonitor {
         Boolean gadgetConnected;
         String gadgetFunctions;
         Boolean ethCarrier;
+        int ethSpeedMbps = -1;
+        String ethDuplex;
     }
 
     /** Best-effort plug + function hints without root (sysfs and/or SystemProperties). */
@@ -1043,6 +1098,8 @@ public class UsbLinkMonitor {
                 + "if [ -n \"$ETH\" ]; then "
                 + "  echo \"ETHCAR:$(cat /sys/class/net/$ETH/carrier 2>/dev/null)\"; "
                 + "  echo \"ETHOPER:$(cat /sys/class/net/$ETH/operstate 2>/dev/null)\"; "
+                + "  echo \"ETHSPEED:$(cat /sys/class/net/$ETH/speed 2>/dev/null)\"; "
+                + "  echo \"ETHDUPLEX:$(cat /sys/class/net/$ETH/duplex 2>/dev/null)\"; "
                 + "fi; "
                 + "TIF=${ETH:-$UIF}; "
                 + "if [ -n \"$TIF\" ]; then "
@@ -1136,6 +1193,11 @@ public class UsbLinkMonitor {
                 String v = line.substring(7).trim();
                 if ("1".equals(v)) r.ethCarrier = true;
                 else if ("0".equals(v)) r.ethCarrier = false;
+            } else if (line.startsWith("ETHSPEED:")) {
+                r.ethSpeedMbps = ethernetPhyMbps(line.substring(9).trim());
+            } else if (line.startsWith("ETHDUPLEX:")) {
+                String v = line.substring(10).trim();
+                if (!v.isEmpty()) r.ethDuplex = v;
             } else if (line.startsWith("MIF:")) {
                 String v = line.substring(4).trim();
                 if (!v.isEmpty()) r.mobileIface = v;

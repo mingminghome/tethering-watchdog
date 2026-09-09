@@ -79,6 +79,26 @@ public class UsbLinkMonitorTest {
     @Test
     public void speedTierLabel_ethernet() {
         assertEquals("Ethernet", UsbLinkMonitor.speedTierLabel("ethernet"));
+        assertEquals("Ethernet · 10 Mbps", UsbLinkMonitor.speedTierLabel("ethernet-10"));
+        assertEquals("Ethernet · 100 Mbps", UsbLinkMonitor.speedTierLabel("ethernet-100"));
+        assertEquals("Ethernet · 1 Gbps", UsbLinkMonitor.speedTierLabel("ethernet-1000"));
+    }
+
+    @Test
+    public void ethernetPhyMbps_parsesAndIgnoresUnknown() {
+        assertEquals(-1, UsbLinkMonitor.ethernetPhyMbps("ethernet"));
+        assertEquals(10, UsbLinkMonitor.ethernetPhyMbps("ethernet-10"));
+        assertEquals(100, UsbLinkMonitor.ethernetPhyMbps("100"));
+        assertEquals(-1, UsbLinkMonitor.ethernetPhyMbps("65535"));
+        assertEquals(-1, UsbLinkMonitor.ethernetPhyMbps("-1"));
+    }
+
+    @Test
+    public void ethernetSpeedTierLabel_halfDuplex() {
+        assertEquals("Ethernet · 10 Mbps half",
+                UsbLinkMonitor.ethernetSpeedTierLabel(10, "half"));
+        assertEquals("Ethernet · 100 Mbps",
+                UsbLinkMonitor.ethernetSpeedTierLabel(100, "full"));
     }
 
     @Test
