@@ -244,7 +244,7 @@ public class RootUtil {
 
     /**
      * Shared uplink / TCP tweaks (both USB and ethernet).
-     * Ethernet then adds link-layer tunings (MSS 1400, EEE/offloads off);
+     * Ethernet then adds link-layer tunings (MSS 1400, EEE off, GRO off);
      * USB keeps the RNDIS 1440 MTU workaround.
      */
     private static final String TCP_AND_FORWARD =
@@ -303,10 +303,12 @@ public class RootUtil {
      * Do NOT switch USB gadget functions — {@code rndis} would drop the hub.
      * Link-layer tunings differ from USB: full 1500 MTU, no RNDIS 1440 clamp,
      * disable USB autosuspend on the adapter, relax rp_filter so NAT forwards,
-     * fixed MSS 1400 (clamp-to-pmtu often no-ops on FORWARD), fq_codel on LAN
-     * and cellular. Do not inflate txqueuelen — 5000 packets at 10 Mbps is ~6s
-     * of bufferbloat when {@code tc} is missing. USB-ethernet offloads and EEE
-     * are disabled: TSO/GRO hurt NAT, EEE often falls back to 10 Mbps.
+     * fixed MSS 1400 (clamp-to-pmtu often no-ops on FORWARD), fq_codel on the
+     * cellular hop only. Do not inflate txqueuelen — 5000 packets at 10 Mbps is
+     * ~6s of bufferbloat when {@code tc} is missing. EEE off (10 Mbps fallback).
+     * GRO off (USB-ethernet NAT); TSO/GSO on so download (phone TX to the LAN)
+     * is not software-segmented. Do not put fq_codel on {@code $ETH}: USB
+     * ethernet usually lacks BQL and that qdisc sits on the download path.
      */
     private static final String ENABLE_ETHERNET =
             "if [ -n \"$ETH\" ]; then\n"
@@ -323,7 +325,7 @@ public class RootUtil {
                     + "  ip link set dev \"$ETH\" mtu 1500 2>/dev/null || ifconfig \"$ETH\" mtu 1500 2>/dev/null || true\n"
                     + "  ip link set dev \"$ETH\" txqueuelen 1000 2>/dev/null || true\n"
                     + "  ethtool --set-eee \"$ETH\" eee off 2>/dev/null || true\n"
-                    + "  ethtool -K \"$ETH\" gro off gso off tso off ufo off 2>/dev/null || true\n"
+                    + "  ethtool -K \"$ETH\" gro off gso on tso on ufo off 2>/dev/null || true\n"
                     + "  ETHSPEED=$(cat /sys/class/net/$ETH/speed 2>/dev/null || echo 0)\n"
                     + "  case \"$ETHSPEED\" in 10|-1|'')\n"
                     + "    ethtool -s \"$ETH\" autoneg on 2>/dev/null || true\n"
@@ -344,7 +346,7 @@ public class RootUtil {
                     + "  echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true\n"
                     + "  echo 0 > /proc/sys/net/ipv4/conf/$ETH/rp_filter 2>/dev/null || true\n"
                     + "  [ -n \"$MOBILE\" ] && echo 2 > /proc/sys/net/ipv4/conf/$MOBILE/rp_filter 2>/dev/null || true\n"
-                    + "  tc qdisc replace dev \"$ETH\" root fq_codel 2>/dev/null || true\n"
+                    + "  tc qdisc del dev \"$ETH\" root 2>/dev/null || true\n"
                     + "  [ -f /sys/class/net/$ETH/queues/rx-0/rps_cpus ] && "
                     + "echo f > /sys/class/net/$ETH/queues/rx-0/rps_cpus 2>/dev/null || true\n"
                     + "  ndc ipfwd enable tethering 2>/dev/null || true\n"

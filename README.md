@@ -4,7 +4,7 @@
 
 - **Package:** `com.mmhw.tetherwatchdog`
 - **Min SDK:** 26 · **Target SDK:** 35
-- **Version:** 1.2
+- **Version:** 1.3
 - **License:** [MIT](LICENSE)
 
 ## Tethering optimization (root)
@@ -42,9 +42,9 @@ Ethernet (USB hub / USB-C dock) — different link-layer path; **does not** use 
 | **rp_filter off** | Strict reverse-path filter otherwise drops NAT’d tether packets |
 | **USB autosuspend off** | Keeps the ethernet adapter awake (autosuspend shows up as jitter) |
 | **EEE off** | Stops many USB adapters falling back to 10 Mbps |
-| **Offloads off** | GRO/GSO/TSO on USB-ethernet NAT forwarding often *cuts* throughput |
+| **GRO off, TSO/GSO on** | GRO on USB-ethernet NAT hurts upload; TSO/GSO keep download (phone→LAN) from being software-segmented |
 | **10 Mbps kick** | If the PHY is 10 Mbps, re-negotiate then try 100/full |
-| **fq_codel** | AQM on ethernet *and* the cellular hop (a 5000-packet TX queue is ~6s of delay at 10 Mbps) |
+| **fq_codel** | AQM on the **cellular** hop only (USB ethernet usually lacks BQL; fq_codel there sits on the download path) |
 
 Without root, the app still **monitors** tether and radio; it cannot apply the kernel / `svc` optimisations above.
 

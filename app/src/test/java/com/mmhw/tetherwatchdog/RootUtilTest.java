@@ -25,10 +25,13 @@ public class RootUtilTest {
     public void resetScript_appliesWanAqmAndEthernetMss() {
         String script = RootUtil.buildResetScript();
         int ethQdisc = script.indexOf("tc qdisc replace dev \"$ETH\" root fq_codel");
+        int ethDel = script.indexOf("tc qdisc del dev \"$ETH\" root");
         int wanQdisc = script.lastIndexOf("tc qdisc replace dev \"$MOBILE\" root fq_codel");
-        assertTrue(ethQdisc >= 0);
+        assertTrue("USB-ethernet must not get fq_codel (download TX, often no BQL)",
+                ethQdisc < 0);
+        assertTrue(ethDel >= 0);
         assertTrue(wanQdisc >= 0);
-        assertTrue("Cellular AQM should run after iface setup", wanQdisc > ethQdisc);
+        assertTrue("Cellular AQM should run after iface setup", wanQdisc > ethDel);
         int oldClamp = script.indexOf("TCPMSS --clamp-mss-to-pmtu");
         int setMss = script.indexOf("TCPMSS --set-mss 1400");
         assertTrue(setMss >= 0);
@@ -62,7 +65,9 @@ public class RootUtilTest {
         assertTrue(script.contains("autosuspend"));
         assertTrue(script.contains("txqueuelen 1000"));
         assertFalse(script.contains("txqueuelen 5000"));
-        assertTrue(script.contains("tso off"));
+        assertTrue(script.contains("tso on"));
+        assertTrue(script.contains("gro off"));
+        assertFalse(script.contains("tso off"));
         assertTrue(script.contains("eee off"));
         assertTrue(script.contains("speed 100 duplex full"));
         assertTrue(script.contains("tcp_mtu_probing=1"));
