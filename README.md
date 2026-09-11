@@ -4,7 +4,7 @@
 
 - **Package:** `com.mmhw.tetherwatchdog`
 - **Min SDK:** 26 · **Target SDK:** 35
-- **Version:** 1.3
+- **Version:** 1.4
 - **License:** [MIT](LICENSE)
 
 ## Tethering optimization (root)
