@@ -78,6 +78,7 @@ public class MainActivity extends AppCompatActivity {
     private String lastNotifiedRadioTransition;
     private String lastAutoTetherKey = "";
     private long lastAutoTetherMs;
+    private boolean resetInFlight;
     private static final long AUTO_TETHER_COOLDOWN_MS = 15_000L;
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
@@ -229,9 +230,11 @@ public class MainActivity extends AppCompatActivity {
             manualBtn.setText("RESETTING...");
             statusText.setText("Resetting network…");
             statusText.setTextColor(0xFFEF6C00);
+            resetInFlight = true;
             markResetNow();
 
             RootUtil.performResetSequence(this, () -> runOnUiThread(() -> {
+                resetInFlight = false;
                 manualBtn.setEnabled(rootOk);
                 manualBtn.setText("RESET");
                 markResetNow();
@@ -419,7 +422,7 @@ public class MainActivity extends AppCompatActivity {
      * that would drop the hub). USB gadget tethering is enabled on Reset / Auto-recover.
      */
     private void maybeAutoEnableTether(UsbLinkMonitor.Snapshot snap) {
-        if (!rootOk || snap == null) return;
+        if (!rootOk || snap == null || resetInFlight) return;
         if (!UsbLinkMonitor.MODE_ETHERNET.equals(snap.tetherMode)) {
             if (lastAutoTetherKey.startsWith("ethernet:")) lastAutoTetherKey = "";
             return;

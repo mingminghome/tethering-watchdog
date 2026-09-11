@@ -111,6 +111,10 @@ public class RootUtil {
      * Bounce mobile data, re-apply tethering optimisations, enable the detected
      * tether path (ethernet hub vs USB RNDIS). Invokes {@code onComplete} on a
      * background thread when finished.
+     * <p>
+     * Ethernet tethering is left running: stopping it releases EthernetManager's
+     * tethered-iface request, the NIC can drop, Settings greys out the toggle,
+     * and a follow-up start often cannot claim the iface again.
      */
     public static void performResetSequence(Runnable onComplete) {
         performResetSequence(null, onComplete);
@@ -121,15 +125,12 @@ public class RootUtil {
             try {
                 String mode = probeTetherMode();
                 Context app = context != null ? context.getApplicationContext() : null;
-                if (app != null) {
-                    // Stop first so TetheringManager is not stuck "already started"
-                    // after the data bounce; Settings can then toggle ethernet again.
-                    stopFrameworkTethering(app, mode);
-                    sleepQuietly(500);
-                }
-                String out = runAsRoot(buildResetScript(), SU_RESET_TIMEOUT_MS);
+                String out = runAsRoot(buildResetScript(mode), SU_RESET_TIMEOUT_MS);
                 if (out != null) markRoot(true);
                 if (app != null) {
+                    // Idempotent if still up; restores if the data bounce dropped it.
+                    startFrameworkTethering(app, mode);
+                    sleepQuietly(800);
                     startFrameworkTethering(app, mode);
                 }
             } finally {
@@ -147,14 +148,11 @@ public class RootUtil {
     /**
      * Enable tethering for the current attachment without bouncing mobile data.
      * Used when a USB hub/ethernet adapter appears (RNDIS would drop the hub).
+     * Never stop first — that is what greys out Settings ethernet tethering.
      */
     public static void enableDetectedTethering(Context context, String mode) {
         new Thread(() -> {
             Context app = context != null ? context.getApplicationContext() : null;
-            if (app != null) {
-                stopFrameworkTethering(app, mode);
-                sleepQuietly(400);
-            }
             String out = runAsRoot(buildEnableTetherScript(mode), SU_RESET_TIMEOUT_MS);
             if (out != null) markRoot(true);
             if (app != null) {
@@ -197,22 +195,15 @@ public class RootUtil {
 
     /**
      * Ask the framework tethering stack (DHCP + NAT) to start. Same path as
-     * Settings ethernet tethering. Hidden APIs may fail; the root script also
-     * calls {@code cmd tethering} as uid 0.
+     * Settings ethernet tethering. Hidden APIs may fail without
+     * {@code TETHER_PRIVILEGED}; the root script also calls {@code cmd tethering}
+     * as uid 0. Start is idempotent if tethering is already on.
      */
     static boolean startFrameworkTethering(Context context, String mode) {
         if (context == null) return false;
         int type = tetherType(mode);
         if (startTetheringManager(context, type)) return true;
         return startConnectivityTethering(context, type);
-    }
-
-    /** Release TetheringManager's ethernet/USB request so Settings can start it again. */
-    static boolean stopFrameworkTethering(Context context, String mode) {
-        if (context == null) return false;
-        int type = tetherType(mode);
-        if (stopTetheringManager(context, type)) return true;
-        return stopConnectivityTethering(context, type);
     }
 
     private static int tetherType(String mode) {
@@ -249,19 +240,6 @@ public class RootUtil {
         return false;
     }
 
-    private static boolean stopTetheringManager(Context context, int type) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false;
-        try {
-            Object tm = context.getSystemService("tethering");
-            if (tm == null) return false;
-            Method stop = tm.getClass().getMethod("stopTethering", int.class);
-            stop.invoke(tm, type);
-            return true;
-        } catch (Exception ignored) {
-        }
-        return false;
-    }
-
     private static boolean startConnectivityTethering(Context context, int type) {
         try {
             ConnectivityManager cm =
@@ -273,19 +251,6 @@ public class RootUtil {
             Method start = cm.getClass().getMethod(
                     "startTethering", int.class, boolean.class, cbClz);
             start.invoke(cm, type, false, cb);
-            return true;
-        } catch (Exception ignored) {
-        }
-        return false;
-    }
-
-    private static boolean stopConnectivityTethering(Context context, int type) {
-        try {
-            ConnectivityManager cm =
-                    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) return false;
-            Method stop = cm.getClass().getMethod("stopTethering", int.class);
-            stop.invoke(cm, type);
             return true;
         } catch (Exception ignored) {
         }
@@ -391,37 +356,32 @@ public class RootUtil {
                     + "fi\n";
 
     /**
-     * Undo leftover ndc/static-IP hijack from older resets so Settings
-     * ethernet tethering can claim the iface again.
+     * Same control plane as Settings; uid 0 via su. Unknown cmds are ignored.
+     * WRITE_SETTINGS appop lets the in-process TetheringManager.startTethering call
+     * succeed if the shell cmd is missing on this build.
      */
-    private static final String RELEASE_ETHERNET_HIJACK =
-            "if [ -n \"$ETH\" ]; then\n"
-                    + "  ndc nat disable \"$ETH\" \"$MOBILE\" 2>/dev/null || true\n"
-                    + "  ndc tether interface remove \"$ETH\" 2>/dev/null || true\n"
-                    + "  ndc tether stop 2>/dev/null || true\n"
-                    + "  ip addr del 192.168.42.129/24 dev \"$ETH\" 2>/dev/null || true\n"
-                    + "fi\n";
-
-    /** Same control plane as Settings; uid 0 via su. Unknown cmds are ignored. */
-    private static final String STOP_FRAMEWORK_TETHER_CMDS =
-            "cmd tethering stop ethernet 2>/dev/null || true\n"
-                    + "cmd tethering stop-tethering ethernet 2>/dev/null || true\n"
-                    + "cmd tethering stop usb 2>/dev/null || true\n"
-                    + "cmd tethering stop-tethering usb 2>/dev/null || true\n";
+    private static final String GRANT_TETHER_APPOPS =
+            "cmd appops set com.mmhw.tetherwatchdog WRITE_SETTINGS allow 2>/dev/null || true\n"
+                    + "appops set com.mmhw.tetherwatchdog WRITE_SETTINGS allow 2>/dev/null || true\n";
 
     private static final String START_ETHERNET_TETHER_CMDS =
-            "cmd tethering start ethernet 2>/dev/null || true\n"
-                    + "cmd tethering start-tethering ethernet 2>/dev/null || true\n";
+            GRANT_TETHER_APPOPS
+                    + "cmd tethering start ethernet 2>/dev/null || true\n"
+                    + "cmd tethering start-tethering ethernet 2>/dev/null || true\n"
+                    + "cmd tethering start-tethering 5 2>/dev/null || true\n";
 
     private static final String START_USB_TETHER_CMDS =
-            "cmd tethering start usb 2>/dev/null || true\n"
+            GRANT_TETHER_APPOPS
+                    + "cmd tethering start usb 2>/dev/null || true\n"
                     + "cmd tethering start-tethering usb 2>/dev/null || true\n";
 
     /**
-     * Ethernet hub/dock tunings only — do not take over DHCP/IP/NAT.
-     * {@code ndc tether start} / static 192.168.42.129 bricks Settings ethernet
-     * tethering. Do not force {@code ethtool speed 100}: that caps gigabit and
-     * can fall back to 10BASE-T. Unknown/-1 speed is not 10 Mbps.
+     * Ethernet hub/dock tunings only — do not take over DHCP/IP/NAT and do not
+     * stop framework tethering. {@code ndc tether start} / static 192.168.42.129
+     * bricks Settings ethernet tethering. Do not force {@code ethtool speed 100}:
+     * that caps gigabit and can fall back to 10BASE-T. Unknown/-1 speed is not
+     * 10 Mbps. Skip unconditional EEE-off: toggling EEE flaps many USB NICs,
+     * Android then turns ethernet tethering off, and Settings greys it out.
      */
     private static final String TUNE_ETHERNET =
             "if [ -n \"$ETH\" ]; then\n"
@@ -437,7 +397,6 @@ public class RootUtil {
                     + "  ip link set \"$ETH\" up 2>/dev/null || ifconfig \"$ETH\" up 2>/dev/null || true\n"
                     + "  ip link set dev \"$ETH\" mtu 1500 2>/dev/null || ifconfig \"$ETH\" mtu 1500 2>/dev/null || true\n"
                     + "  ip link set dev \"$ETH\" txqueuelen 1000 2>/dev/null || true\n"
-                    + "  ethtool --set-eee \"$ETH\" eee off 2>/dev/null || true\n"
                     + "  ethtool -K \"$ETH\" gro off gso on tso on ufo off 2>/dev/null || true\n"
                     + "  CARRIER=$(cat /sys/class/net/$ETH/carrier 2>/dev/null || echo 0)\n"
                     + "  ETHSPEED=$(cat /sys/class/net/$ETH/speed 2>/dev/null || echo 0)\n"
@@ -482,21 +441,20 @@ public class RootUtil {
                     + "iptables -t mangle -A POSTROUTING -j TTL --ttl-set 64 2>/dev/null || true\n";
 
     static String buildResetScript() {
-        return DETECT_ETH
-                + STOP_FRAMEWORK_TETHER_CMDS
-                + RELEASE_ETHERNET_HIJACK
+        return buildResetScript(null);
+    }
+
+    /**
+     * @param mode {@link UsbLinkMonitor#MODE_ETHERNET} pins the ethernet branch so a
+     *             momentary iface blip cannot fall through to RNDIS (that drops the hub).
+     */
+    static String buildResetScript(String mode) {
+        return forceEthPrefix(mode)
+                + DETECT_ETH
                 + RESET_COMMON
                 + DETECT_ETH
                 + PICK_MOBILE
-                + "if [ -n \"$ETH\" ]; then\n"
-                + TUNE_ETHERNET
-                + START_ETHERNET_TETHER_CMDS
-                + "else\n"
-                + ENABLE_USB
-                + START_USB_TETHER_CMDS
-                + "fi\n"
-                + WAN_AQM
-                + TTL_FIX;
+                + ethernetOrUsbBranch();
     }
 
     static String buildEnableTetherScript(String mode) {
@@ -504,12 +462,23 @@ public class RootUtil {
         // (that would switch the phone to gadget mode and drop the hub).
         String tag = mode != null ? mode : "auto";
         return "echo MODE:" + tag + "\n"
+                + forceEthPrefix(mode)
                 + TCP_AND_FORWARD
                 + DETECT_ETH
-                + STOP_FRAMEWORK_TETHER_CMDS
-                + RELEASE_ETHERNET_HIJACK
                 + PICK_MOBILE
-                + "if [ -n \"$ETH\" ]; then\n"
+                + ethernetOrUsbBranch();
+    }
+
+    private static String forceEthPrefix(String mode) {
+        return UsbLinkMonitor.MODE_ETHERNET.equals(mode) ? "FORCE_ETH=1\n" : "FORCE_ETH=\n";
+    }
+
+    /**
+     * Ethernet when the NIC is present <em>or</em> the Java probe already saw a
+     * hub. Never {@code svc usb setFunctions rndis} in that case.
+     */
+    private static String ethernetOrUsbBranch() {
+        return "if [ -n \"$ETH\" ] || [ -n \"$FORCE_ETH\" ]; then\n"
                 + TUNE_ETHERNET
                 + START_ETHERNET_TETHER_CMDS
                 + "else\n"

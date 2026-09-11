@@ -259,6 +259,8 @@ public class WatchdogService extends Service {
         int action = UsbLinkMonitor.ethernetRecoverAction(
                 wantEthernetTether, present, usb.ethernetLinkUp, usb.tetherAlive);
 
+        if (resetInFlight) return;
+
         if (action == UsbLinkMonitor.ETH_RECOVER_IDLE) {
             lastAutoTetherKey = "ethernet:" + usb.ethernetIface;
             ethernetHealFails = 0;

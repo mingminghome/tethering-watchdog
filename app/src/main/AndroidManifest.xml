@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- Lets TetheringManager.startTethering succeed after root grants the appop. -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <!-- 4G / 4G+ / 5G display type (TelephonyDisplayInfo) -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />

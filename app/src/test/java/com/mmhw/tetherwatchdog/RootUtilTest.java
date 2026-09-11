@@ -69,6 +69,10 @@ public class RootUtilTest {
         assertTrue(script.contains("gro off"));
         assertFalse(script.contains("tso off"));
         assertTrue(script.contains("eee off"));
+        // Unconditional EEE-off flaps many USB NICs; only use it on a real 10 Mbps link.
+        int firstEee = script.indexOf("ethtool --set-eee");
+        int speed10 = script.indexOf("ETHSPEED\" = 10");
+        assertTrue(firstEee >= 0 && speed10 >= 0 && speed10 < firstEee);
         assertTrue(script.contains("tcp_mtu_probing=1"));
         assertTrue(script.contains("tcp_slow_start_after_idle=0"));
         // USB 1440 must stay on the gadget path, not be applied to $ETH
@@ -88,14 +92,35 @@ public class RootUtilTest {
         assertFalse(script.contains("ndc nat enable"));
         assertFalse(script.contains("ip addr add 192.168.42.129"));
         assertFalse(script.contains("iptables -P FORWARD ACCEPT"));
-        assertTrue(script.contains("ndc tether interface remove"));
-        assertTrue(script.contains("ip addr del 192.168.42.129"));
+        // Stopping / stripping the LAN IP is what greys out Settings ethernet tethering.
+        assertFalse(script.contains("ndc tether interface remove"));
+        assertFalse(script.contains("ndc tether stop"));
+        assertFalse(script.contains("ip addr del 192.168.42.129"));
+        assertFalse(script.contains("cmd tethering stop"));
+        assertFalse(script.contains("cmd tethering stop-tethering"));
         assertTrue(script.contains("cmd tethering start ethernet"));
-        assertTrue(script.contains("cmd tethering stop ethernet"));
-        int stop = script.indexOf("cmd tethering stop ethernet");
-        int dataOff = script.indexOf("svc data disable");
-        assertTrue("Must release ethernet tethering before the data bounce",
-                stop >= 0 && dataOff >= 0 && stop < dataOff);
+        assertTrue(script.contains("svc data disable"));
+    }
+
+    @Test
+    public void resetScript_ethernetModeNeverForcesRndis() {
+        String script = RootUtil.buildResetScript(UsbLinkMonitor.MODE_ETHERNET);
+        assertTrue(script.contains("FORCE_ETH=1"));
+        assertTrue(script.contains("[ -n \"$FORCE_ETH\" ]"));
+        int rndis = script.indexOf("svc usb setFunctions rndis,adb");
+        int forceBranch = script.indexOf("[ -n \"$FORCE_ETH\" ]");
+        assertTrue(rndis >= 0 && forceBranch >= 0 && forceBranch < rndis);
+    }
+
+    @Test
+    public void enableScript_doesNotStopEthernetTethering() {
+        String script = RootUtil.buildEnableTetherScript(UsbLinkMonitor.MODE_ETHERNET);
+        assertFalse(script.contains("cmd tethering stop"));
+        assertFalse(script.contains("ndc tether stop"));
+        assertFalse(script.contains("ndc tether interface remove"));
+        assertFalse(script.contains("ip addr del 192.168.42.129"));
+        assertTrue(script.contains("FORCE_ETH=1"));
+        assertTrue(script.contains("cmd tethering start ethernet"));
     }
 
     @Test

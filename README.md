@@ -9,13 +9,13 @@
 
 ## Tethering optimization (root)
 
-These run when you press **RESET** or when **Auto-recover** heals the link (`RootUtil.performResetSequence` / `forceMobileDataPriority`). Tether mode is auto-detected: a USB hub / ethernet adapter uses **ethernet tethering**; a direct cable to a PC uses **USB (RNDIS)** tethering. Reset uses the same detection — it will **not** force RNDIS while a hub is attached (that would drop the hub).
+These run when you press **RESET** or when **Auto-recover** heals the link (`RootUtil.performResetSequence` / `forceMobileDataPriority`). Tether mode is auto-detected: a USB hub / ethernet adapter uses **ethernet tethering**; a direct cable to a PC uses **USB (RNDIS)** tethering. Reset uses the same detection — it will **not** force RNDIS while a hub is attached (that would drop the hub), and it **does not turn ethernet tethering off** (that greys out Settings → Ethernet tethering).
 
 Shared (both modes):
 
 | Optimization | What it does |
 |--------------|----------------|
-| **Mobile data bounce** | `svc data` off → on so the radio reattaches cleanly |
+| **Mobile data bounce** | `svc data` off → on so the radio reattaches cleanly. Ethernet tethering is **left running** — stopping it greys out Settings → Ethernet tethering. |
 | **DNS flush** | Clears resolver state that can stick after a bad tether |
 | **TCP tuning** | Window scaling, larger `rmem`/`wmem`, **BBR**, MTU probing, no slow-start after idle |
 | **IP forwarding** | Ensures the phone can forward tether traffic |
