@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Root helpers for network bounce + tether optimisation.
  * USB gadget (RNDIS) and ethernet-hub paths share TCP/uplink tweaks but use
- * different link-layer tunings (see {@link #ENABLE_USB} vs {@link #ENABLE_ETHERNET}).
+ * different link-layer tunings (see {@link #ENABLE_USB} vs {@link #TUNE_ETHERNET}).
  * Prefer one su session so steps run in order without re-auth races.
  * Caches root availability so UI polls do not spawn needless {@code su} probes.
  */
@@ -32,6 +32,8 @@ public class RootUtil {
     /** Retry su often when denied — Magisk grant for a new release signature is common. */
     private static final long ROOT_FAIL_RETRY_MS = 5_000L;
     private static final long SU_TIMEOUT_MS = 12_000L;
+    /** Reset/enable scripts sleep for radio + autoneg; a 12s kill leaves tethering half-applied. */
+    private static final long SU_RESET_TIMEOUT_MS = 30_000L;
 
     private static final AtomicReference<Boolean> rootAvailable = new AtomicReference<>(null);
     private static final AtomicLong rootProbedAtMs = new AtomicLong(0);
@@ -118,11 +120,18 @@ public class RootUtil {
         new Thread(() -> {
             try {
                 String mode = probeTetherMode();
-                if (context != null) {
-                    startFrameworkTethering(context.getApplicationContext(), mode);
+                Context app = context != null ? context.getApplicationContext() : null;
+                if (app != null) {
+                    // Stop first so TetheringManager is not stuck "already started"
+                    // after the data bounce; Settings can then toggle ethernet again.
+                    stopFrameworkTethering(app, mode);
+                    sleepQuietly(500);
                 }
-                String out = runAsRoot(buildResetScript());
+                String out = runAsRoot(buildResetScript(), SU_RESET_TIMEOUT_MS);
                 if (out != null) markRoot(true);
+                if (app != null) {
+                    startFrameworkTethering(app, mode);
+                }
             } finally {
                 if (onComplete != null) {
                     onComplete.run();
@@ -141,11 +150,16 @@ public class RootUtil {
      */
     public static void enableDetectedTethering(Context context, String mode) {
         new Thread(() -> {
-            if (context != null) {
-                startFrameworkTethering(context.getApplicationContext(), mode);
+            Context app = context != null ? context.getApplicationContext() : null;
+            if (app != null) {
+                stopFrameworkTethering(app, mode);
+                sleepQuietly(400);
             }
-            String out = runAsRoot(buildEnableTetherScript(mode));
+            String out = runAsRoot(buildEnableTetherScript(mode), SU_RESET_TIMEOUT_MS);
             if (out != null) markRoot(true);
+            if (app != null) {
+                startFrameworkTethering(app, mode);
+            }
         }, "tether-enable").start();
     }
 
@@ -182,15 +196,27 @@ public class RootUtil {
     private static final int TETHERING_ETHERNET = 5;
 
     /**
-     * Ask the framework tethering stack (DHCP + NAT) to start. Best-effort:
-     * hidden APIs / entitlement may fail; the root script is the fallback.
+     * Ask the framework tethering stack (DHCP + NAT) to start. Same path as
+     * Settings ethernet tethering. Hidden APIs may fail; the root script also
+     * calls {@code cmd tethering} as uid 0.
      */
     static boolean startFrameworkTethering(Context context, String mode) {
         if (context == null) return false;
-        int type = UsbLinkMonitor.MODE_ETHERNET.equals(mode)
-                ? TETHERING_ETHERNET : TETHERING_USB;
+        int type = tetherType(mode);
         if (startTetheringManager(context, type)) return true;
         return startConnectivityTethering(context, type);
+    }
+
+    /** Release TetheringManager's ethernet/USB request so Settings can start it again. */
+    static boolean stopFrameworkTethering(Context context, String mode) {
+        if (context == null) return false;
+        int type = tetherType(mode);
+        if (stopTetheringManager(context, type)) return true;
+        return stopConnectivityTethering(context, type);
+    }
+
+    private static int tetherType(String mode) {
+        return UsbLinkMonitor.MODE_ETHERNET.equals(mode) ? TETHERING_ETHERNET : TETHERING_USB;
     }
 
     private static boolean startTetheringManager(Context context, int type) {
@@ -209,8 +235,7 @@ public class RootUtil {
             Object request = builderClz.getMethod("build").invoke(builder);
             Class<?> reqClz = Class.forName("android.net.TetheringManager$TetheringRequest");
             Class<?> cbClz = Class.forName("android.net.TetheringManager$StartTetheringCallback");
-            Object cb = Proxy.newProxyInstance(cbClz.getClassLoader(), new Class<?>[]{cbClz},
-                    (p, m, a) -> null);
+            Object cb = silentCallback(cbClz);
             for (Method m : tm.getClass().getMethods()) {
                 if (!"startTethering".equals(m.getName())) continue;
                 Class<?>[] ps = m.getParameterTypes();
@@ -224,6 +249,19 @@ public class RootUtil {
         return false;
     }
 
+    private static boolean stopTetheringManager(Context context, int type) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false;
+        try {
+            Object tm = context.getSystemService("tethering");
+            if (tm == null) return false;
+            Method stop = tm.getClass().getMethod("stopTethering", int.class);
+            stop.invoke(tm, type);
+            return true;
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
     private static boolean startConnectivityTethering(Context context, int type) {
         try {
             ConnectivityManager cm =
@@ -231,8 +269,7 @@ public class RootUtil {
             if (cm == null) return false;
             Class<?> cbClz = Class.forName(
                     "android.net.ConnectivityManager$OnStartTetheringCallback");
-            Object cb = Proxy.newProxyInstance(cbClz.getClassLoader(), new Class<?>[]{cbClz},
-                    (p, m, a) -> null);
+            Object cb = silentCallback(cbClz);
             Method start = cm.getClass().getMethod(
                     "startTethering", int.class, boolean.class, cbClz);
             start.invoke(cm, type, false, cb);
@@ -240,6 +277,36 @@ public class RootUtil {
         } catch (Exception ignored) {
         }
         return false;
+    }
+
+    private static boolean stopConnectivityTethering(Context context, int type) {
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return false;
+            Method stop = cm.getClass().getMethod("stopTethering", int.class);
+            stop.invoke(cm, type);
+            return true;
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    /** Avoid NPEs if the framework stores the proxy in a map (equals/hashCode). */
+    private static Object silentCallback(Class<?> cbClz) {
+        return Proxy.newProxyInstance(cbClz.getClassLoader(), new Class<?>[]{cbClz}, (p, m, a) -> {
+            String name = m.getName();
+            if ("hashCode".equals(name)) return System.identityHashCode(p);
+            if ("equals".equals(name)) {
+                return a != null && a.length > 0 && p == a[0];
+            }
+            if ("toString".equals(name)) return "TetherWatchdogCb";
+            Class<?> ret = m.getReturnType();
+            if (ret == boolean.class) return Boolean.FALSE;
+            if (ret == int.class) return 0;
+            if (ret == long.class) return 0L;
+            return null;
+        });
     }
 
     /**
@@ -253,7 +320,8 @@ public class RootUtil {
                     + "sysctl -w net.core.wmem_max=16777216 2>/dev/null || true\n"
                     + "sysctl -w net.ipv4.tcp_rmem='4096 87380 16777216' 2>/dev/null || true\n"
                     + "sysctl -w net.ipv4.tcp_wmem='4096 65536 16777216' 2>/dev/null || true\n"
-                    + "sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true\n"
+                    + "sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null "
+                    + "|| sysctl -w net.ipv4.tcp_congestion_control=cubic 2>/dev/null || true\n"
                     + "sysctl -w net.ipv4.tcp_mtu_probing=1 2>/dev/null || true\n"
                     + "sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null || true\n"
                     + "sysctl -w net.core.netdev_max_backlog=5000 2>/dev/null || true\n"
@@ -284,33 +352,78 @@ public class RootUtil {
                     + "  ETH=$(ls /sys/class/net 2>/dev/null | grep -E '^(eth[0-9]+|usbeth|lan[0-9]+|enx)' | head -n1)\n"
                     + "fi\n";
 
+    /**
+     * Drop Wi‑Fi / ethernet defaults so tether uplink is cellular. Keep the
+     * radio's existing default (gateway + iface). Do not replace it with a
+     * gateway-less route or a hardcoded {@code rmnet_data0} — that pins traffic
+     * to the first PDN (often LTE/IMS) while 5G is on another rmnet.
+     */
     private static final String PICK_MOBILE =
-            "ip route del default dev wlan0 2>/dev/null || true\n"
-                    + "ip route del default dev eth0 2>/dev/null || true\n"
-                    + "ip route del default dev eth1 2>/dev/null || true\n"
-                    + "MOBILE=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}')\n"
+            "ip -4 route show default 2>/dev/null | while read -r line; do\n"
+                    + "  d=$(echo \"$line\" | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}')\n"
+                    + "  case \"$d\" in rmnet*|ccmni*|pdp*|wwan*|seth*|v4-rmnet*|cdc*) ;; "
+                    + "*) ip route del default dev \"$d\" 2>/dev/null || true ;; esac\n"
+                    + "done\n"
+                    + "MOBILE=$(ip -4 route show default 2>/dev/null | awk "
+                    + "'{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}')\n"
                     + "case \"$MOBILE\" in ''|lo|wlan*|rndis*|ncm*|usb*|eth*|lan*|enx*) MOBILE='' ;; esac\n"
                     + "if [ -z \"$MOBILE\" ]; then\n"
-                    + "  MOBILE=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | "
-                    + "grep -E '^(rmnet_data[0-9]+|rmnet[0-9]+|pdp_ip0|ccmni0)$' | head -n1)\n"
+                    + "  MOBILE=$(ip -4 route show table all default 2>/dev/null | awk "
+                    + "'{for(i=1;i<=NF;i++) if($i==\"dev\") d=$(i+1)} "
+                    + "d ~ /^(rmnet|ccmni|pdp|wwan|seth|v4-rmnet|cdc)/ {print d; exit}')\n"
                     + "fi\n"
-                    + "[ -n \"$MOBILE\" ] || MOBILE=rmnet_data0\n"
-                    + "ip route replace default dev \"$MOBILE\" 2>/dev/null || "
-                    + "ip route add default dev \"$MOBILE\" 2>/dev/null || true\n";
+                    + "if [ -z \"$MOBILE\" ]; then\n"
+                    + "  MOBILE=$(for n in /sys/class/net/*; do\n"
+                    + "    b=$(basename \"$n\")\n"
+                    + "    case \"$b\" in rmnet*|ccmni*|pdp*|wwan*|seth*|v4-rmnet*|cdc*)\n"
+                    + "      st=$(cat \"$n/operstate\" 2>/dev/null || echo down)\n"
+                    + "      [ \"$st\" = up ] || [ \"$st\" = unknown ] || continue\n"
+                    + "      ip -4 -o addr show dev \"$b\" 2>/dev/null | grep -q inet || continue\n"
+                    + "      rx=$(cat \"$n/statistics/rx_bytes\" 2>/dev/null || echo 0)\n"
+                    + "      echo \"$rx $b\"\n"
+                    + "    ;; esac\n"
+                    + "  done | sort -nr | awk '{print $2; exit}')\n"
+                    + "fi\n"
+                    + "if [ -n \"$MOBILE\" ] && [ -d /sys/class/net/$MOBILE ]; then\n"
+                    + "  if ! ip -4 route show default 2>/dev/null | grep -q .; then\n"
+                    + "    ip route add default dev \"$MOBILE\" 2>/dev/null || true\n"
+                    + "  fi\n"
+                    + "fi\n";
 
     /**
-     * Ethernet tethering (USB hub / USB-C dock).
-     * Do NOT switch USB gadget functions — {@code rndis} would drop the hub.
-     * Link-layer tunings differ from USB: full 1500 MTU, no RNDIS 1440 clamp,
-     * disable USB autosuspend on the adapter, relax rp_filter so NAT forwards,
-     * fixed MSS 1400 (clamp-to-pmtu often no-ops on FORWARD), fq_codel on the
-     * cellular hop only. Do not inflate txqueuelen — 5000 packets at 10 Mbps is
-     * ~6s of bufferbloat when {@code tc} is missing. EEE off (10 Mbps fallback).
-     * GRO off (USB-ethernet NAT); TSO/GSO on so download (phone TX to the LAN)
-     * is not software-segmented. Do not put fq_codel on {@code $ETH}: USB
-     * ethernet usually lacks BQL and that qdisc sits on the download path.
+     * Undo leftover ndc/static-IP hijack from older resets so Settings
+     * ethernet tethering can claim the iface again.
      */
-    private static final String ENABLE_ETHERNET =
+    private static final String RELEASE_ETHERNET_HIJACK =
+            "if [ -n \"$ETH\" ]; then\n"
+                    + "  ndc nat disable \"$ETH\" \"$MOBILE\" 2>/dev/null || true\n"
+                    + "  ndc tether interface remove \"$ETH\" 2>/dev/null || true\n"
+                    + "  ndc tether stop 2>/dev/null || true\n"
+                    + "  ip addr del 192.168.42.129/24 dev \"$ETH\" 2>/dev/null || true\n"
+                    + "fi\n";
+
+    /** Same control plane as Settings; uid 0 via su. Unknown cmds are ignored. */
+    private static final String STOP_FRAMEWORK_TETHER_CMDS =
+            "cmd tethering stop ethernet 2>/dev/null || true\n"
+                    + "cmd tethering stop-tethering ethernet 2>/dev/null || true\n"
+                    + "cmd tethering stop usb 2>/dev/null || true\n"
+                    + "cmd tethering stop-tethering usb 2>/dev/null || true\n";
+
+    private static final String START_ETHERNET_TETHER_CMDS =
+            "cmd tethering start ethernet 2>/dev/null || true\n"
+                    + "cmd tethering start-tethering ethernet 2>/dev/null || true\n";
+
+    private static final String START_USB_TETHER_CMDS =
+            "cmd tethering start usb 2>/dev/null || true\n"
+                    + "cmd tethering start-tethering usb 2>/dev/null || true\n";
+
+    /**
+     * Ethernet hub/dock tunings only — do not take over DHCP/IP/NAT.
+     * {@code ndc tether start} / static 192.168.42.129 bricks Settings ethernet
+     * tethering. Do not force {@code ethtool speed 100}: that caps gigabit and
+     * can fall back to 10BASE-T. Unknown/-1 speed is not 10 Mbps.
+     */
+    private static final String TUNE_ETHERNET =
             "if [ -n \"$ETH\" ]; then\n"
                     + "  DEV=$(readlink -f /sys/class/net/$ETH/device 2>/dev/null)\n"
                     + "  n=0\n"
@@ -326,20 +439,14 @@ public class RootUtil {
                     + "  ip link set dev \"$ETH\" txqueuelen 1000 2>/dev/null || true\n"
                     + "  ethtool --set-eee \"$ETH\" eee off 2>/dev/null || true\n"
                     + "  ethtool -K \"$ETH\" gro off gso on tso on ufo off 2>/dev/null || true\n"
+                    + "  CARRIER=$(cat /sys/class/net/$ETH/carrier 2>/dev/null || echo 0)\n"
                     + "  ETHSPEED=$(cat /sys/class/net/$ETH/speed 2>/dev/null || echo 0)\n"
-                    + "  case \"$ETHSPEED\" in 10|-1|'')\n"
-                    + "    ethtool -s \"$ETH\" autoneg on 2>/dev/null || true\n"
+                    + "  if [ \"$CARRIER\" = 1 ] && [ \"$ETHSPEED\" = 10 ]; then\n"
                     + "    ethtool --set-eee \"$ETH\" eee off 2>/dev/null || true\n"
+                    + "    ethtool -s \"$ETH\" autoneg on 2>/dev/null || true\n"
+                    + "    ethtool -r \"$ETH\" 2>/dev/null || true\n"
                     + "    sleep 2\n"
-                    + "    ETHSPEED=$(cat /sys/class/net/$ETH/speed 2>/dev/null || echo 0)\n"
-                    + "    case \"$ETHSPEED\" in 10|-1|'')\n"
-                    + "      ethtool -s \"$ETH\" speed 100 duplex full autoneg on 2>/dev/null || true\n"
-                    + "      sleep 1\n"
-                    + "      ;;\n"
-                    + "    esac\n"
-                    + "    ;;\n"
-                    + "  esac\n"
-                    + "  ip addr add 192.168.42.129/24 dev \"$ETH\" 2>/dev/null || true\n"
+                    + "  fi\n"
                     + "  echo 1 > /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/null || true\n"
                     + "  echo 1 > /proc/sys/net/ipv4/conf/$ETH/forwarding 2>/dev/null || true\n"
                     + "  [ -n \"$MOBILE\" ] && echo 1 > /proc/sys/net/ipv4/conf/$MOBILE/forwarding 2>/dev/null || true\n"
@@ -350,17 +457,6 @@ public class RootUtil {
                     + "  [ -f /sys/class/net/$ETH/queues/rx-0/rps_cpus ] && "
                     + "echo f > /sys/class/net/$ETH/queues/rx-0/rps_cpus 2>/dev/null || true\n"
                     + "  ndc ipfwd enable tethering 2>/dev/null || true\n"
-                    + "  ndc tether interface add \"$ETH\" 2>/dev/null || true\n"
-                    + "  ndc tether start 192.168.42.2 192.168.42.254 2>/dev/null || true\n"
-                    + "  ndc nat enable \"$ETH\" \"$MOBILE\" 0 192.168.42.2 192.168.42.254 2>/dev/null || true\n"
-                    + "  ndc tether dns set 1.1.1.1 8.8.8.8 2>/dev/null || true\n"
-                    + "  iptables -P FORWARD ACCEPT 2>/dev/null || true\n"
-                    + "  iptables -t nat -C POSTROUTING -o \"$MOBILE\" -j MASQUERADE 2>/dev/null || "
-                    + "iptables -t nat -A POSTROUTING -o \"$MOBILE\" -j MASQUERADE 2>/dev/null || true\n"
-                    + "  iptables -C FORWARD -i \"$ETH\" -j ACCEPT 2>/dev/null || "
-                    + "iptables -A FORWARD -i \"$ETH\" -j ACCEPT 2>/dev/null || true\n"
-                    + "  iptables -C FORWARD -o \"$ETH\" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || "
-                    + "iptables -A FORWARD -o \"$ETH\" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true\n"
                     + "  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
                     + "  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1400 2>/dev/null || true\n"
                     + "  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1400 2>/dev/null || true\n"
@@ -386,13 +482,18 @@ public class RootUtil {
                     + "iptables -t mangle -A POSTROUTING -j TTL --ttl-set 64 2>/dev/null || true\n";
 
     static String buildResetScript() {
-        return RESET_COMMON
+        return DETECT_ETH
+                + STOP_FRAMEWORK_TETHER_CMDS
+                + RELEASE_ETHERNET_HIJACK
+                + RESET_COMMON
                 + DETECT_ETH
                 + PICK_MOBILE
                 + "if [ -n \"$ETH\" ]; then\n"
-                + ENABLE_ETHERNET
+                + TUNE_ETHERNET
+                + START_ETHERNET_TETHER_CMDS
                 + "else\n"
                 + ENABLE_USB
+                + START_USB_TETHER_CMDS
                 + "fi\n"
                 + WAN_AQM
                 + TTL_FIX;
@@ -405,11 +506,15 @@ public class RootUtil {
         return "echo MODE:" + tag + "\n"
                 + TCP_AND_FORWARD
                 + DETECT_ETH
+                + STOP_FRAMEWORK_TETHER_CMDS
+                + RELEASE_ETHERNET_HIJACK
                 + PICK_MOBILE
                 + "if [ -n \"$ETH\" ]; then\n"
-                + ENABLE_ETHERNET
+                + TUNE_ETHERNET
+                + START_ETHERNET_TETHER_CMDS
                 + "else\n"
                 + ENABLE_USB
+                + START_USB_TETHER_CMDS
                 + "fi\n"
                 + WAN_AQM
                 + TTL_FIX;
@@ -426,8 +531,20 @@ public class RootUtil {
         }, "tether-route").start();
     }
 
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /** @return stdout if process exits 0 or produced output, else null */
     private static String runAsRoot(String scriptBody) {
+        return runAsRoot(scriptBody, SU_TIMEOUT_MS);
+    }
+
+    private static String runAsRoot(String scriptBody, long timeoutMs) {
         Process p = null;
         try {
             p = Runtime.getRuntime().exec(new String[]{"su"});
@@ -447,7 +564,8 @@ public class RootUtil {
             os.close();
 
             String out = readAll(p.getInputStream());
-            boolean finished = p.waitFor(SU_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            long waitMs = timeoutMs > 0 ? timeoutMs : SU_TIMEOUT_MS;
+            boolean finished = p.waitFor(waitMs, TimeUnit.MILLISECONDS);
             if (!finished) {
                 p.destroyForcibly();
                 return null;

@@ -20,7 +20,7 @@ Shared (both modes):
 | **TCP tuning** | Window scaling, larger `rmem`/`wmem`, **BBR**, MTU probing, no slow-start after idle |
 | **IP forwarding** | Ensures the phone can forward tether traffic |
 | **TTL fix** | `iptables` mangle TTL 64 (reduces some carrier tether detection quirks) |
-| **Mobile default route** | Drops Wi‑Fi / ethernet default when needed; prefers cellular (`rmnet*` / similar) as uplink |
+| **Mobile default route** | Drops Wi‑Fi / ethernet default when needed; keeps the radio’s existing cellular default (does not pin to `rmnet_data0`) |
 | **Auto-recover** | Background heal on USB reconnect, hub unplug/replug, or a dead ethernet path. If the ethernet link drops, Android turns ethernet tethering off — Auto-recover waits for the link and turns it back on (no mobile-data bounce while the link is down). |
 | **Route priority on start** | Auto-recover service prefers mobile as default route without a full bounce |
 
@@ -35,7 +35,7 @@ Ethernet (USB hub / USB-C dock) — different link-layer path; **does not** use 
 
 | Optimization | What it does |
 |--------------|----------------|
-| **Ethernet tethering** | Enable ethernet tethering, leave USB in host mode (RNDIS would drop the hub) |
+| **Ethernet tethering** | Enable ethernet tethering via the same framework path as Settings (RNDIS would drop the hub) |
 | **Auto-enable hub** | When a hub/ethernet adapter appears, ethernet tethering is turned on automatically |
 | **MTU 1500** | Full ethernet frames on `eth*` |
 | **MSS 1400** | `TCPMSS --set-mss 1400` so 1500 LAN packets fit typical cellular tunnels (`clamp-to-pmtu` often no-ops on FORWARD) |
@@ -43,7 +43,7 @@ Ethernet (USB hub / USB-C dock) — different link-layer path; **does not** use 
 | **USB autosuspend off** | Keeps the ethernet adapter awake (autosuspend shows up as jitter) |
 | **EEE off** | Stops many USB adapters falling back to 10 Mbps |
 | **GRO off, TSO/GSO on** | GRO on USB-ethernet NAT hurts upload; TSO/GSO keep download (phone→LAN) from being software-segmented |
-| **10 Mbps kick** | If the PHY is 10 Mbps, re-negotiate then try 100/full |
+| **10 Mbps recover** | If carrier is up and the PHY is actually 10 Mbps, restart autoneg (never force 100 Mbps — that caps gigabit) |
 | **fq_codel** | AQM on the **cellular** hop only (USB ethernet usually lacks BQL; fq_codel there sits on the download path) |
 
 Without root, the app still **monitors** tether and radio; it cannot apply the kernel / `svc` optimisations above.
